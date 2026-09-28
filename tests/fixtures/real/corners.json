@@ -1,0 +1,9 @@
+{
+  "_comment": "Outer corners of the 8x8 playing area (the 64 squares; not the black ring, not the wooden frame) in 1920x1080 pixel coordinates, clockwise starting from the corner with the smallest x+y. Annotated on zoomed crops, accuracy about 3 px. Hidden corners were extrapolated along the visible thin printed boundary lines.",
+  "01-front-oblique-high.jpg": { "width": 1920, "height": 1080, "corners": [[592, 251], [1212, 235], [1325, 843], [555, 885]] },
+  "02-diagonal-oblique.jpg": { "width": 1920, "height": 1080, "corners": [[397.5, 475.5], [879, 104], [1392, 401], [922.5, 936]] },
+  "03-near-overhead-rotated.jpg": { "width": 1920, "height": 1080, "corners": [[517, 439], [987, 236], [1239.5, 639], [752, 915]] },
+  "04-side-low-oblique.jpg": { "width": 1920, "height": 1080, "corners": [[825, 241], [1348, 253], [1421.5, 817.5], [394, 736]] },
+  "05-dim-light-diagonal.jpg": { "width": 1920, "height": 1080, "corners": [[556, 580], [965, 242.5], [1406, 414], [1133, 895]] },
+  "neg-01-tablecloth-tiles.jpg": { "width": 1920, "height": 1080, "corners": null }
+}
