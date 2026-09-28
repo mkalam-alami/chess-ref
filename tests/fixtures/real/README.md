@@ -11,6 +11,9 @@ All five show the same board: a black/light-grey printed playing surface inside 
 | 03-near-overhead-rotated.jpg | Close to overhead, rotated about 30° | Weak perspective |
 | 04-side-low-oblique.jpg | Low oblique from the side | Strong perspective; tall pieces hide rows 1–2 and 7–8; board side and thickness visible |
 | 05-dim-light-diagonal.jpg | Oblique, rotated | Dim light, visible sensor noise, slight blur |
+| neg-01-tablecloth-tiles.jpg | **Negative (no board)** | A hard negative. A tablecloth with a strong repeating geometric line grid (squares, octagons, diagonals, gold lines), and large floor tiles forming a perspective grid. Warm, dim light with glare. The detector must return `null`. |
+
+Files starting with `neg-` contain no chessboard. They have no `corners.json` entry, and any detection on them counts as a false positive.
 
 ## Why these are harder than the synthetic set
 - **The printed black ring next to the playing area looks like more dark squares.** It is the same colour as the dark squares and sits right on the outer grid lines, so a comb fit can slip one cell outward. The checker-verification bonus for "the margin is not checkered" is what has to reject that.
