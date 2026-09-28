@@ -4,7 +4,7 @@ import { stabiliseCorners } from './geom/cornerOrder';
 import type { Quad } from './geom/homography';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS } from './overlay';
-import { PREPROCESS_PARAMS } from './vision/preprocess';
+import { ALL_PARAMS } from './vision/detector';
 import type { FrameMessage, ResultMessage, WorkerToMain } from './worker/protocol';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -16,7 +16,7 @@ const loading = $('loading');
 const setStatus = (s: string) => (app.dataset.status = s);
 const setWorker = (s: string) => (app.dataset.worker = s);
 
-for (const p of PREPROCESS_PARAMS) registerParam(p.name, p.min, p.max, p.step, p.default);
+for (const p of ALL_PARAMS) registerParam(p.name, p.min, p.max, p.step, p.default);
 
 const overlay = new Overlay($<HTMLCanvasElement>('overlay'));
 const panel = new DebugPanel(app);

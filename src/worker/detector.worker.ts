@@ -1,7 +1,8 @@
 /// <reference lib="webworker" />
 import opencv from '@techstark/opencv-js';
 import type { CV } from '../vision/preprocess';
-import { Preprocessor } from '../vision/preprocess';
+import { Detector } from '../vision/detector';
+import { drawLines, drawVerify, rectifiedView } from '../vision/debugViews';
 import type { DebugView, FrameMessage, ResultMessage, WorkerToMain } from './protocol';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
@@ -47,7 +48,7 @@ async function loadOpenCV(): Promise<{ cv: CV }> {
 
 interface State {
   cv: CV;
-  pre: Preprocessor;
+  detector: Detector;
   rgba: InstanceType<CV['Mat']> | null;
   rgbaOut: InstanceType<CV['Mat']>;
 }
@@ -87,17 +88,48 @@ async function process(msg: FrameMessage): Promise<void> {
   s.rgba.data.set(img.data);
   timings.decode = performance.now() - t;
 
-  const pre = s.pre.run(s.rgba, msg.params);
-  Object.assign(timings, pre.timings);
+  const view: DebugView = msg.debugView;
+  const wantDebug = view === 'lines' || view === 'rectified' || view === 'verify';
+  const det = s.detector.detect(s.rgba, msg.params, { debug: wantDebug });
+  Object.assign(timings, det.timings);
+  const pre = s.detector.lastPre!;
 
   t = performance.now();
   let debugImage: ImageBitmap | undefined;
-  const view: DebugView = msg.debugView;
   if (view === 'raw') {
     debugImage = await toBitmap(new Uint8ClampedArray(img.data) as Uint8ClampedArray<ArrayBuffer>, width, height);
   } else if (view === 'gradient' || view === 'edges') {
     cv.cvtColor(view === 'gradient' ? pre.gradient : pre.edges, s.rgbaOut, cv.COLOR_GRAY2RGBA);
     debugImage = await toBitmap(new Uint8ClampedArray(s.rgbaOut.data) as Uint8ClampedArray<ArrayBuffer>, width, height);
+  } else if (wantDebug && det.debug) {
+    const c = new OffscreenCanvas(width, height);
+    const ctx = c.getContext('2d')!;
+    if (view === 'rectified') {
+      const rv = rectifiedView(det.debug, width, height);
+      if (rv) {
+        const hm = cv.matFromArray(3, 3, cv.CV_64F, rv.h);
+        try {
+          cv.warpPerspective(pre.l, s.rgbaOut, hm, new cv.Size(width, height), cv.INTER_LINEAR);
+          cv.cvtColor(s.rgbaOut, s.rgbaOut, cv.COLOR_GRAY2RGBA);
+        } finally {
+          hm.delete();
+        }
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(s.rgbaOut.data), width, height), 0, 0);
+        ctx.strokeStyle = 'rgba(255,60,60,0.8)';
+        ctx.lineWidth = 1;
+        for (const [a, b] of rv.lines) {
+          ctx.beginPath();
+          ctx.moveTo(a[0], a[1]);
+          ctx.lineTo(b[0], b[1]);
+          ctx.stroke();
+        }
+      }
+    } else {
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), width, height), 0, 0);
+      if (view === 'lines') drawLines(ctx, det.debug);
+      else drawVerify(ctx, det.debug);
+    }
+    debugImage = await createImageBitmap(c);
   }
   timings.debug = performance.now() - t;
   timings.total = performance.now() - total;
@@ -107,8 +139,8 @@ async function process(msg: FrameMessage): Promise<void> {
     id: msg.id,
     width,
     height,
-    corners: null,
-    confidence: 0,
+    corners: det.corners,
+    confidence: det.confidence,
     mode: 'full',
     timings,
     debugImage,
@@ -133,7 +165,7 @@ loadOpenCV().then(
   ({ cv }) => {
     state = {
       cv,
-      pre: new Preprocessor(cv),
+      detector: new Detector(cv),
       rgba: null,
       rgbaOut: new cv.Mat(),
     };
