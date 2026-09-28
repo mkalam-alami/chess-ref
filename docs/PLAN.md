@@ -125,6 +125,17 @@ Dependencies: `vite`, `typescript`, `@techstark/opencv-js` (imported inside the 
 4. **First quad.** Rectification, comb fit and verification produce the first quad overlay.
 5. **Stability.** Refinement, tracking mode, One-Euro smoothing, hold-then-fade.
 6. **Tuning.** Adjust on recorded clips of wooden and vinyl boards; tune thresholds; check performance on a real Android phone.
+7. **Auto board profile (lock and reset).**
+   - **Lock:** after the first confident full detection (and after it is confirmed over a few frames), infer the board's profile:
+     - the best verification channel (L, a\* or b\*) and the contrast level on it;
+     - the surround type (dark ring, frame or bare edge), from the margin-ring statistics.
+   - **Once locked:**
+     - preprocessing computes only the gradient and edges for the channels that profile needs (e.g. L only for printed black/grey boards);
+     - verification uses the locked channel, with a threshold scaled to the observed contrast;
+     - the margin test expects the observed surround.
+   - **Unlock:** the profile is dropped automatically after a long loss of the board (e.g. more than 5 s with no detection), so a different board can be picked up.
+   - **UI:** a single "Reset board" button returns to auto mode. There is no manual picker. The debug panel shows the locked profile.
+   - **Goal:** performance first. Measure full-detection time before and after on the real photos and the synthetic set. Accuracy must not regress; check it on the real photos (printed B&W is the only real profile available) and on the synthetic vinyl and wood sets.
 
 ## Verification
 - **Unit tests (Vitest)** for the pure geometry: VP estimation, rectification, comb fitting, corner-order stabilisation. Test inputs are synthetic line sets.
