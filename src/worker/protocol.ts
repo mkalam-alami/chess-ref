@@ -1,5 +1,5 @@
-export type DebugView = 'raw' | 'gradient' | 'edges' | 'lines' | 'rectified' | 'verify';
-export const DEBUG_VIEWS: readonly DebugView[] = ['raw', 'gradient', 'edges', 'lines', 'rectified', 'verify'];
+export type DebugView = 'none' | 'gradient' | 'edges' | 'lines' | 'rectified' | 'verify';
+export const DEBUG_VIEWS: readonly DebugView[] = ['none', 'gradient', 'edges', 'lines', 'rectified', 'verify'];
 
 /** Slider values registered in the debug panel, keyed by parameter name. */
 export type Params = Record<string, number>;

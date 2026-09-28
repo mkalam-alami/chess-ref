@@ -80,8 +80,13 @@ function handleResult(r: ResultMessage): void {
   mode = r.mode;
   lastFrameW = r.width;
   lastFrameH = r.height;
-  if (r.debugImage) overlay.setDebugImage(r.debugImage);
-  else if (panel.view === 'raw' || !panel.visible) overlay.setDebugImage(null);
+  // A debug image is only ever shown while the panel is open and a real view is selected; otherwise it would
+  // be a lagging copy of the video drawn over the live stream (ghosting).
+  if (r.debugImage && panel.visible && panel.view !== 'none') overlay.setDebugImage(r.debugImage);
+  else {
+    r.debugImage?.close();
+    overlay.setDebugImage(null);
+  }
   if (r.corners) {
     // Reset smoothing after the quad has fully faded so stale state does not drag the new one.
     if (overlay.msSinceQuad(now) > HOLD_MS + FADE_MS) {
@@ -157,7 +162,7 @@ async function pump(): Promise<void> {
     width: frame.width,
     height: frame.height,
     params: getParams(),
-    debugView: panel.view,
+    debugView: panel.visible ? panel.view : 'none',
   };
   inFlightId = msg.id;
   worker.postMessage(msg, [frame.bitmap]);

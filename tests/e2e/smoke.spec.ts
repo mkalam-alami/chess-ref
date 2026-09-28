@@ -13,12 +13,21 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   await expect(app).toHaveAttribute('data-worker', 'ready', { timeout: 60_000 });
   await expect(page.locator('video.media')).toBeVisible();
 
+  // With the panel closed no debug image may be drawn over the live video (it would lag and ghost).
+  await page.waitForTimeout(1500);
+  await expect(page.locator('#overlay')).toHaveAttribute('data-debug-image', 'off');
+
   // Frames flow through the worker: open the panel and wait for stage timings.
   await page.click('.dbg-toggle');
   await expect(page.locator('.dbg-panel pre')).toContainText('canny', { timeout: 30_000 });
   await page.selectOption('.dbg-panel select >> nth=0', 'edges');
-  await page.waitForTimeout(1000);
+  await expect(page.locator('#overlay')).toHaveAttribute('data-debug-image', 'on', { timeout: 15_000 });
+  await page.waitForTimeout(500);
   await page.screenshot({ path: 'test-results/smoke.png' });
+
+  // Closing the panel clears the debug image again.
+  await page.click('.dbg-toggle');
+  await expect(page.locator('#overlay')).toHaveAttribute('data-debug-image', 'off', { timeout: 15_000 });
 
   expect(errors).toEqual([]);
 });

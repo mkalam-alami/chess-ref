@@ -96,9 +96,7 @@ async function process(msg: FrameMessage): Promise<void> {
 
   t = performance.now();
   let debugImage: ImageBitmap | undefined;
-  if (view === 'raw') {
-    debugImage = await toBitmap(new Uint8ClampedArray(img.data) as Uint8ClampedArray<ArrayBuffer>, width, height);
-  } else if (view === 'gradient' || view === 'edges') {
+  if (view === 'gradient' || view === 'edges') {
     cv.cvtColor(view === 'gradient' ? pre.gradient : pre.edges, s.rgbaOut, cv.COLOR_GRAY2RGBA);
     debugImage = await toBitmap(new Uint8ClampedArray(s.rgbaOut.data) as Uint8ClampedArray<ArrayBuffer>, width, height);
   } else if (wantDebug && det.debug) {

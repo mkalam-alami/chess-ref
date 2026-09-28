@@ -75,6 +75,7 @@ export class Overlay {
 
   constructor(private canvas: HTMLCanvasElement) {
     this.ctx = canvas.getContext('2d')!;
+    canvas.dataset.debugImage = 'off';
     this.resize();
     window.addEventListener('resize', () => this.resize());
     window.addEventListener('orientationchange', () => this.resize());
@@ -102,6 +103,7 @@ export class Overlay {
   setDebugImage(image: ImageBitmap | null, alpha = 0.6): void {
     this.debugImage?.image.close();
     this.debugImage = image ? { image, alpha } : null;
+    this.canvas.dataset.debugImage = image ? 'on' : 'off';
   }
 
   draw(nowMs: number, frameW: number, frameH: number): void {

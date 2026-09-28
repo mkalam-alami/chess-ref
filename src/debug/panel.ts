@@ -68,7 +68,7 @@ export class DebugPanel {
   readonly panel: HTMLDivElement;
   private stats: HTMLPreElement;
   private sliders: HTMLDivElement;
-  private _view: DebugView = 'raw';
+  private _view: DebugView = 'none';
   private _resolution = 640;
   private resolutionListeners: Array<(r: number) => void> = [];
   private viewListeners: Array<(v: DebugView) => void> = [];
