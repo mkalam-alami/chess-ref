@@ -1,5 +1,6 @@
 import { applyH, homographyFrom4, type Mat3, type Point } from '../geom/homography';
 import type { CV } from './preprocess';
+import type { CornerPoint } from './refine';
 
 type Mat = InstanceType<CV['Mat']>;
 
@@ -45,7 +46,7 @@ export class EdgePolisher {
     this.dt.delete();
   }
 
-  polish(edges: Mat, hb: Mat3, opts: { maxShiftFrac: number } = { maxShiftFrac: 0.05 }): PolishResult {
+  polish(edges: Mat, hb: Mat3, opts: { maxShiftFrac: number; points?: readonly CornerPoint[]; pointWeight?: number } = { maxShiftFrac: 0.05 }): PolishResult {
     const cv = this.cv;
     cv.bitwise_not(edges, this.inv);
     cv.distanceTransform(this.inv, this.dt, cv.DIST_L2, 3);
@@ -80,6 +81,8 @@ export class EdgePolisher {
     const cap = Math.max(2.5, Math.min(8, 0.3 * cell));
     const maxShift = opts.maxShiftFrac * diag;
 
+    const pts = opts.points;
+    const pw = opts.pointWeight ?? 1;
     const cost = (c: Point[]): number => {
       const H = homographyFrom4(board, c);
       if (!H) return Infinity;
@@ -89,7 +92,19 @@ export class EdgePolisher {
         if (wv <= 1e-6) return Infinity;
         s += sample((H[0] * u + H[1] * v + H[2]) / wv, (H[3] * u + H[4] * v + H[5]) / wv, cap);
       }
-      return s / GRID_POINTS.length;
+      let total = s / GRID_POINTS.length;
+      if (pts && pts.length > 0) {
+        let cs = 0;
+        for (const q of pts) {
+          const wv = H[6] * q.gi + H[7] * q.gj + 1;
+          if (wv <= 1e-6) return Infinity;
+          const dx = (H[0] * q.gi + H[1] * q.gj + H[2]) / wv - q.x;
+          const dy = (H[3] * q.gi + H[4] * q.gj + H[5]) / wv - q.y;
+          cs += Math.min(cap, Math.hypot(dx, dy));
+        }
+        total += pw * (cs / pts.length);
+      }
+      return total;
     };
 
     let cur = c0.map((p) => [p[0], p[1]] as Point);

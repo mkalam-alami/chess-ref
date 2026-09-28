@@ -6,6 +6,7 @@ import { combOptions, fitComb, GRID_PARAMS, segmentPositions, toothSegments, typ
 import { extractLines, LINES_PARAMS } from './lines';
 import { param, Preprocessor, PREPROCESS_PARAMS, type CV, type ParamSpec, type PreprocessResult } from './preprocess';
 import { EdgePolisher } from './polish';
+import { CornerRefiner, refineOptions, REFINE_PARAMS, type RefineResult } from './refine';
 import { boardCorners, verifyBoard, verifyOptions, VERIFY_PARAMS, type Lab3, type VerifyResult } from './verify';
 
 type Mat = InstanceType<CV['Mat']>;
@@ -16,7 +17,10 @@ export const VANISHING_PARAMS: readonly ParamSpec[] = [
   { name: 'vpMinSeparation', min: 5, max: 60, step: 1, default: 20 },
 ];
 
-export const POLISH_PARAMS: readonly ParamSpec[] = [{ name: 'polish', min: 0, max: 1, step: 1, default: 1 }];
+export const POLISH_PARAMS: readonly ParamSpec[] = [
+  { name: 'polish', min: 0, max: 1, step: 1, default: 1 },
+  { name: 'refit', min: 0, max: 1, step: 1, default: 1 },
+];
 
 /** All tunables of the detection pipeline; the main thread registers them as debug sliders. */
 export const ALL_PARAMS: readonly ParamSpec[] = [
@@ -26,6 +30,7 @@ export const ALL_PARAMS: readonly ParamSpec[] = [
   ...GRID_PARAMS,
   ...VERIFY_PARAMS,
   ...POLISH_PARAMS,
+  ...REFINE_PARAMS,
 ];
 
 export interface CandidateInfo {
@@ -52,6 +57,7 @@ export interface DetectDebug {
   best: CandidateInfo | null;
   /** Board->image homography after the edge polish. */
   polished?: Mat3;
+  refined?: { hb: Mat3; inliers: number; accepted: number; rms: number };
   /** Why no board was reported, when applicable. */
   reason?: string;
 }
@@ -95,6 +101,7 @@ function quadArea(q: readonly Point[]): number {
 export class Detector {
   private readonly pre: Preprocessor;
   private readonly polisher: EdgePolisher;
+  private readonly refiner = new CornerRefiner();
   private rgba: Mat | null = null;
   /** Preprocessing outputs of the last detect() (valid until the next call). */
   lastPre: PreprocessResult | null = null;
@@ -186,7 +193,7 @@ export class Detector {
     let solved = pass1;
     // Second pass: re-estimate both VPs from the segments that sit on the fitted grid lines only (no clutter,
     // no frame lines), then repeat. This sharpens the VPs, which matters for the far rows of oblique views.
-    if (pass1.best && pass1.best.verify.score > 0.15 && pass1.rect) {
+    if (param(params, POLISH_PARAMS, 'refit') > 0 && pass1.best && pass1.best.verify.score > 0.15 && pass1.rect) {
       const m1 = toothSegments(nsegs, pair.vp1.inliers, pass1.rect.H, 0, pass1.best.hx, 0.2);
       const m2 = toothSegments(nsegs, pair.vp2.inliers, pass1.rect.H, 1, pass1.best.hy, 0.2);
       if (m1.length >= 4 && m2.length >= 4) {
@@ -219,13 +226,34 @@ export class Detector {
     // 7. Edge-alignment polish of the accepted candidate. (The corner-level refinement of the next milestone
     // would be inserted here, after verification.)
     let hb = best.hb;
+    let score = best.verify.score;
+    const doRefine = param(params, REFINE_PARAMS, 'refine') > 0;
+    let rr: RefineResult | null = null;
+    if (doRefine) {
+      rr = this.refiner.refine(ctx.lab, hb, refineOptions(params, best.verify.channel));
+      lap('refine');
+    }
     if (param(params, POLISH_PARAMS, 'polish') > 0) {
-      hb = this.polisher.polish(pre.edges, hb).hb;
+      const joint = rr?.ok && param(params, REFINE_PARAMS, 'refineJoint') > 0;
+      hb = this.polisher.polish(pre.edges, hb, {
+        maxShiftFrac: 0.05,
+        points: joint ? rr!.points : undefined,
+        pointWeight: param(params, REFINE_PARAMS, 'refineJoint'),
+      }).hb;
       if (debug) debug.polished = hb;
       lap('polish');
     }
+    if (rr?.ok && param(params, REFINE_PARAMS, 'refineReplace') > 0 && isValidQuad(boardCorners(rr.hb), width, height)) {
+      const v = verifyBoard(ctx.lab, rr.hb, verifyOptions(params));
+      if (v.score >= score - param(params, REFINE_PARAMS, 'refineKeepTol')) {
+        hb = rr.hb;
+        score = Math.max(v.score, score * 0.999);
+      }
+      lap('refineVerify');
+    }
+    if (debug && rr?.ok) debug.refined = { hb: rr.hb, inliers: rr.inliers, accepted: rr.accepted, rms: rr.rms };
     const corners = orientedCorners(boardCorners(hb));
-    return finish(corners, best.verify.score);
+    return finish(corners, score);
   }
 }
 

@@ -1,5 +1,6 @@
 // Entry of `npm run bench` (see vitest.bench.config.ts). Environment: BENCH_N (samples per category), BENCH_SEED,
-// BENCH_FILTER (substring of the category label), BENCH_DUMP (max failure PNGs per run).
+// BENCH_FILTER (substring of the category label), BENCH_DUMP (max failure PNGs per run),
+// BENCH_PARAMS (JSON of parameter overrides, e.g. {"refine":0}), BENCH_ONLY=real|synth, BENCH_VERBOSE=1.
 import path from 'node:path';
 import fs from 'node:fs';
 import { test } from 'vitest';
@@ -35,7 +36,7 @@ test('bench', async () => {
     ...(filter || only === 'synth' ? [] : [...realCases(cv, 640), ...realCases(cv, 800)]),
   ];
   const genSec = (Date.now() - t0) / 1000;
-  const outs: Outcome[] = runCases(det, cases, {}, true);
+  const outs: Outcome[] = runCases(det, cases, JSON.parse(process.env.BENCH_PARAMS ?? '{}') as Record<string, number>, true);
   if (process.env.BENCH_VERBOSE) {
     for (const o of outs) {
       const d = o.res.debug!;
