@@ -8,6 +8,7 @@ import { param, Preprocessor, PREPROCESS_PARAMS, type CV, type ParamSpec, type P
 import { EdgePolisher } from './polish';
 import { CornerRefiner, refineOptions, REFINE_PARAMS, type RefineResult } from './refine';
 import type { BoardProfile } from './profile';
+import { PROFILE_PARAMS } from './profile';
 import { boardCorners, verifyBoard, verifyOptions, VERIFY_PARAMS, type Lab3, type VerifyOptions, type VerifyResult } from './verify';
 
 type Mat = InstanceType<CV['Mat']>;
@@ -32,6 +33,7 @@ export const ALL_PARAMS: readonly ParamSpec[] = [
   ...VERIFY_PARAMS,
   ...POLISH_PARAMS,
   ...REFINE_PARAMS,
+  ...PROFILE_PARAMS,
 ];
 
 export interface CandidateInfo {

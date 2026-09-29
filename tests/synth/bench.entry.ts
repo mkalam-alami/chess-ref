@@ -57,6 +57,7 @@ test('bench', async () => {
       const p = locked.profiles[i];
       const key = `${o.c.label.replace(/-\d+$/, '')} ${p ? `ch=${p.channels.join('')} v=${p.verifyChannel} ${p.surround}` : 'none'}`;
       prof.set(key, (prof.get(key) ?? 0) + 1);
+      if (process.env.BENCH_VERBOSE && outs[i]!.ok !== o.ok) console.log('DIFF', o.c.name, 'unlocked', outs[i]!.ok ? 'ok' : `fail(${outs[i]!.err})`, 'locked', o.ok ? 'ok' : `fail(${o.err})`, JSON.stringify(p), 'conf', outs[i]!.res.confidence.toFixed(2), o.res.confidence.toFixed(2));
       if (process.env.BENCH_VERBOSE && o.c.label.startsWith('real')) console.log(o.c.name, JSON.stringify(p), 'unlocked err', outs[i]!.err, 'locked err', o.err);
     });
     console.log([...prof.entries()].sort().map(([k, v]) => `${k}: ${v}`).join('\n'));

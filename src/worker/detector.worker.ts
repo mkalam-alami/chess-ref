@@ -3,7 +3,8 @@ import opencv from '@techstark/opencv-js';
 import type { CV } from '../vision/preprocess';
 import { Detector } from '../vision/detector';
 import { drawLines, drawVerify, rectifiedView } from '../vision/debugViews';
-import type { DebugView, FrameMessage, ResultMessage, WorkerToMain } from './protocol';
+import { ProfileLock } from '../vision/profile';
+import type { DebugView, FrameMessage, MainToWorker, ResultMessage, WorkerToMain } from './protocol';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -53,6 +54,8 @@ interface State {
   rgbaOut: InstanceType<CV['Mat']>;
 }
 
+// --- board profile lock (agent B) ---
+const profileLock = new ProfileLock();
 let state: State | null = null;
 let canvas: OffscreenCanvas | null = null;
 
@@ -90,7 +93,8 @@ async function process(msg: FrameMessage): Promise<void> {
 
   const view: DebugView = msg.debugView;
   const wantDebug = view === 'lines' || view === 'rectified' || view === 'verify';
-  const det = s.detector.detect(s.rgba, msg.params, { debug: wantDebug });
+  const det = s.detector.detect(s.rgba, msg.params, { debug: wantDebug, profile: profileLock.profile }); // TODO(A): pass profile into track() too
+  const profile = profileLock.update(det, performance.now(), msg.params);
   Object.assign(timings, det.timings);
   const pre = s.detector.lastPre!;
 
@@ -141,6 +145,7 @@ async function process(msg: FrameMessage): Promise<void> {
     confidence: det.confidence,
     mode: 'full',
     timings,
+    profile,
     debugImage,
   };
   post(result, debugImage ? [debugImage] : []);
@@ -148,8 +153,12 @@ async function process(msg: FrameMessage): Promise<void> {
 
 let queue: Promise<void> = Promise.resolve();
 
-scope.onmessage = (ev: MessageEvent<FrameMessage>) => {
+scope.onmessage = (ev: MessageEvent<MainToWorker>) => {
   const msg = ev.data;
+  if (msg.type === 'resetProfile') {
+    profileLock.reset();
+    return;
+  }
   if (msg.type !== 'frame' || !state) return;
   queue = queue.then(() =>
     process(msg).catch((e: unknown) => {

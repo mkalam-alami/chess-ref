@@ -4,6 +4,8 @@ export const DEBUG_VIEWS: readonly DebugView[] = ['none', 'gradient', 'edges', '
 /** Slider values registered in the debug panel, keyed by parameter name. */
 export type Params = Record<string, number>;
 
+import type { BoardProfile } from '../vision/profile';
+
 export type Corner = [number, number];
 export type Corners = [Corner, Corner, Corner, Corner];
 
@@ -19,7 +21,12 @@ export interface FrameMessage {
   debugView: DebugView;
 }
 
-export type MainToWorker = FrameMessage;
+/** Drops the locked board profile (the "Reset board" button). */
+export interface ResetProfileMessage {
+  type: 'resetProfile';
+}
+
+export type MainToWorker = FrameMessage | ResetProfileMessage;
 
 export interface ReadyMessage {
   type: 'ready';
@@ -43,6 +50,8 @@ export interface ResultMessage {
   mode: 'full' | 'tracking';
   /** Milliseconds per stage, plus 'total'. */
   timings: Record<string, number>;
+  /** Board profile locked in the worker after this frame, or null while auto-detecting. */
+  profile?: BoardProfile | null;
   /** Frame-sized RGBA image for the selected debug view (transferred). */
   debugImage?: ImageBitmap;
 }
