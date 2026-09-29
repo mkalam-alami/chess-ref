@@ -41,6 +41,8 @@ export const TRACK_PARAMS: readonly ParamSpec[] = [
   { name: 'trackFullEvery', min: 0, max: 200, step: 5, default: 30 },
   /** Worker: force a full detection when the last one is older than this many ms. */
   { name: 'trackMaxMs', min: 200, max: 5000, step: 100, default: 1000 },
+  /** Worker: keep the orientation reference this long (ms) after the board is lost, so a re-detection keeps its labelling. */
+  { name: 'trackOrientMs', min: 0, max: 10000, step: 100, default: 3000 },
   /** Worker: 0 disables tracking entirely. */
   { name: 'tracking', min: 0, max: 1, step: 1, default: 1 },
 ];

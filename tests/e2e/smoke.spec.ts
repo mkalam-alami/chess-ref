@@ -20,6 +20,9 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   // No board profile is locked without a board in view, so the reset button stays hidden.
   await expect(page.locator('#resetBoard')).toBeHidden();
 
+  // Every result carries an occupancy field: null (no board / dropped) or a 64-cell grid.
+  await expect(app).toHaveAttribute('data-occupancy', /^(null|u8:64)$/, { timeout: 30_000 });
+
   // Frames flow through the worker: open the panel and wait for stage timings.
   await page.click('.dbg-toggle');
   await expect(page.locator('.dbg-panel pre')).toContainText('canny', { timeout: 30_000 });

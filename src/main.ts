@@ -97,6 +97,9 @@ function handleResult(r: ResultMessage): void {
   modeCounts[r.mode]++;
   lastFrameW = r.width;
   lastFrameH = r.height;
+  // Test hook (e2e): shape of the last result's occupancy field.
+  const occ = r.occupancy;
+  app.dataset.occupancy = occ === undefined ? 'missing' : occ === null ? 'null' : occ instanceof Uint8Array ? `u8:${occ.length}` : 'invalid';
   if (r.occupancyStats) {
     occStats = r.occupancyStats;
     occDrops.push([now, r.occupancyStats.dropped]);

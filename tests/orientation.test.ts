@@ -127,4 +127,55 @@ describe('TrackingSession orientation', () => {
     expect(s.process(input, 640, 480, { tracking: 0 }, {}, 20).corners).toBeNull();
     expect(s.locked).toBe(false);
   });
+
+  /** Fake detector whose next result is `board` in the dihedral labelling `label` (null board = not found). */
+  function scriptedDetector() {
+    const state: { board: Mat3 | null; label: number } = { board: H, label: 0 };
+    const res = () => {
+      if (!state.board) return { corners: null, confidence: 0, timings: {} };
+      const hb = mul3(state.board, BOARD_DIHEDRAL[state.label]!);
+      return { corners: hbCorners(hb), confidence: 1, timings: {}, hb };
+    };
+    return { state, detector: { detect: res, track: res } as unknown as Detector };
+  }
+  const full = { tracking: 0 } as Params;
+
+  it('keeps the labelling across a lost frame when the re-detection comes back rotated', () => {
+    for (const label of [1, 2, 3]) {
+      const { state, detector } = scriptedDetector();
+      const s = new TrackingSession(detector);
+      const first = s.process(input, 640, 480, full, {}, 0).hb!;
+      state.board = null;
+      expect(s.process(input, 640, 480, full, {}, 33).corners).toBeNull();
+      expect(s.locked).toBe(false);
+      state.board = H;
+      state.label = label; // rotated 90/180/270 degrees
+      const r = s.process(input, 640, 480, full, {}, 66);
+      expect(sameBoardMapping(r.hb!, first)).toBe(true);
+      expect(close(r.corners!, hbCorners(first))).toBe(true);
+    }
+  });
+
+  it('frees the labelling after trackOrientMs without a board, on reset() and on resize', () => {
+    const params = { tracking: 0, trackOrientMs: 1000 } as Params;
+    const rotated = mul3(H, BOARD_DIHEDRAL[2]!);
+    const run = (lose: (s: TrackingSession) => number) => {
+      const { state, detector } = scriptedDetector();
+      const s = new TrackingSession(detector);
+      s.process(input, 640, 480, params, {}, 0);
+      state.board = null;
+      const t = lose(s);
+      state.board = H;
+      state.label = 2;
+      return s.process(input, 640, 480, params, {}, t).hb!;
+    };
+    // Lost for longer than trackOrientMs: the re-detection keeps the detector's own labelling.
+    expect(sameBoardMapping(run((s) => (s.process(input, 640, 480, params, {}, 100), 1200)), rotated)).toBe(true);
+    // Still within trackOrientMs: the old labelling is restored.
+    expect(sameBoardMapping(run((s) => (s.process(input, 640, 480, params, {}, 100), 900)), H)).toBe(true);
+    // reset() drops it immediately.
+    expect(sameBoardMapping(run((s) => (s.reset(), 100)), rotated)).toBe(true);
+    // A frame-size change drops it too.
+    expect(sameBoardMapping(run((s) => (s.process(input, 320, 240, params, {}, 50), 100)), rotated)).toBe(true);
+  });
 });
