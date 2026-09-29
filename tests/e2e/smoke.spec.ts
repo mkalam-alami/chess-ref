@@ -6,6 +6,8 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   page.on('pageerror', (e) => errors.push(String(e)));
 
   await page.goto('./');
+  // The move sidebar is hidden on the start screen.
+  await expect(page.locator('#moves')).toBeHidden();
   await page.click('#startBtn');
 
   const app = page.locator('#app');
@@ -27,6 +29,19 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
 
   // Every result carries an occupancy field: null (no board / dropped) or a 64-cell grid.
   await expect(app).toHaveAttribute('data-occupancy', /^(null|u8:64)$/, { timeout: 30_000 });
+
+  // Game layer: the sidebar is shown with a status line, and no game can have started without a board in view
+  // ('playing' is allowed in case a saved game was restored).
+  await expect(app).toHaveAttribute('data-game', /^(waiting|playing)$/);
+  const moves = page.locator('#moves');
+  await expect(moves).toBeVisible();
+  await expect(moves.locator('.mv-status')).not.toBeEmpty();
+  await expect(moves.locator('.mv-copy')).toBeVisible();
+  // Collapsing keeps only the toggle; expanding restores the list.
+  await moves.locator('.mv-toggle').click();
+  await expect(moves.locator('.mv-copy')).toBeHidden();
+  await moves.locator('.mv-toggle').click();
+  await expect(moves.locator('.mv-copy')).toBeVisible();
 
   // Frames flow through the worker: open the panel and wait for stage timings.
   await page.click('.dbg-toggle');
