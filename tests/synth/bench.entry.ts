@@ -1,5 +1,6 @@
 // Entry of `npm run bench` (see vitest.bench.config.ts). Environment: BENCH_N (samples per category), BENCH_SEED,
 // BENCH_FILTER (substring of the category label), BENCH_DUMP (max failure PNGs per run),
+// BENCH_OCC=0 skips occupancy, BENCH_OCC_N (samples per occupancy category),
 // BENCH_PARAMS (JSON of parameter overrides, e.g. {"refine":0}), BENCH_ONLY=real|synth, BENCH_VERBOSE=1.
 import path from 'node:path';
 import fs from 'node:fs';
@@ -7,6 +8,7 @@ import { test } from 'vitest';
 import { Detector } from '../../src/vision/detector';
 import { encodePng } from './png';
 import { loadCv } from './cvNode';
+import { occupancyBench } from './occBench';
 import { dumpFailure, formatTable, negativeCases, realCases, recallWhere, runCases, runCasesLocked, summarize, synthCases, type Outcome } from './bench';
 
 const OUT = path.resolve(import.meta.dirname, 'out');
@@ -84,6 +86,11 @@ test('bench', async () => {
   const some = recallWhere(outs, (l) => synth(l) && !l.endsWith('none'));
   const all = recallWhere(outs, synth);
   console.log(`synthetic recall: no pieces ${(clear.recall * 100).toFixed(1)}% (n=${clear.n}), with pieces ${(some.recall * 100).toFixed(1)}% (n=${some.n}), all ${(all.recall * 100).toFixed(1)}%  [generation ${genSec.toFixed(1)}s]`);
+  if (!filter && only !== 'real' && process.env.BENCH_OCC !== '0') {
+    const t1 = Date.now();
+    const nOcc = Number(process.env.BENCH_OCC_N ?? 6);
+    console.log(`\noccupancy (start calibration, then 1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Bxc6 from the same camera):\n${occupancyBench(cv, det, nOcc, seed + 50000)}  [${((Date.now() - t1) / 1000).toFixed(1)}s]`);
+  }
   fs.rmSync(OUT, { recursive: true, force: true });
   let dumped = 0;
   const files: string[] = [];

@@ -1,10 +1,14 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { homographyFrom4, invert3, mul3, applyH, type Mat3, type Point } from '../src/geom/homography';
+import { mul3 } from '../src/geom/homography';
 import { Detector } from '../src/vision/detector';
 import type { CV } from '../src/vision/preprocess';
 import { cameraFromHomography, cellFootprints, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
+import { realCases } from './synth/bench';
+import { alignGt } from './synth/occBench';
 import { loadCv } from './synth/cvNode';
+import fs from 'node:fs';
+import path from 'node:path';
 import { H, makeBoardSample, makeCamera, W } from './synth/generate';
 
 /** Generator camera with the principal point at the image centre; hb in cell units (board 0..8). */
@@ -113,23 +117,6 @@ interface Eval {
   dropped: number;
 }
 
-/** Ground truth re-indexed into the detector's hb cell frame (null if hb is not a relabelling of the GT board). */
-function alignGt(gt: Uint8Array, gtCorners: readonly Point[], hb: Mat3): Uint8Array | null {
-  const hgt = homographyFrom4([[0, 0], [8, 0], [8, 8], [0, 8]], gtCorners);
-  const inv = hgt && invert3(hgt);
-  if (!inv) return null;
-  const m = mul3(inv, hb);
-  const out = new Uint8Array(64);
-  for (let c = 0; c < 64; c++) {
-    const [u, v] = applyH(m, [(c & 7) + 0.5, (c >> 3) + 0.5]);
-    const i = Math.floor(u);
-    const j = Math.floor(v);
-    if (i < 0 || j < 0 || i > 7 || j > 7 || Math.hypot(u - i - 0.5, v - j - 0.5) > 0.25) return null;
-    out[c] = gt[j * 8 + i]!;
-  }
-  return out;
-}
-
 describe('occupancy on synthetic starting positions', () => {
   let cv: CV;
   let det: Detector;
@@ -171,5 +158,70 @@ describe('occupancy on synthetic starting positions', () => {
     expect(ev.n).toBeGreaterThanOrEqual(10);
     expect(ev.boots / ev.n).toBeGreaterThanOrEqual(0.75);
     expect(ev.rawAcc / ev.n).toBeGreaterThanOrEqual(0.85);
+  }, 120_000);
+});
+
+describe('occupancy on real starting-position photos', () => {
+  let cv: CV;
+  let det: Detector;
+  beforeAll(async () => {
+    ({ cv } = await loadCv());
+    det = new Detector(cv);
+  }, 60_000);
+
+  /** Starting grid in the annotated-corner frame: edge k (corners[k] -> corners[k + 1]) is y = 0, x = 8, y = 8, x = 0. */
+  const gtStart = (whiteEdge: number) => [startGrid(0, 0), startGrid(1, 1), startGrid(0, 1), startGrid(1, 0)][whiteEdge]!;
+
+  it('calibrates on the starting position and classifies the cells, within budget at 640 px', () => {
+    const meta = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/real/corners.json'), 'utf8')) as Record<string, { whiteEdge?: number }>;
+    const lines: string[] = [];
+    let n = 0;
+    let boots = 0;
+    let rawSum = 0;
+    let gridSum = 0;
+    let grids = 0;
+    const times: number[] = [];
+    for (const c of realCases(cv, 640)) {
+      if (!c.gt) continue;
+      const edge = meta[`${c.name.split('@')[0]}.jpg`]?.whiteEdge;
+      if (edge === undefined) continue;
+      const frame = { data: c.rgba, width: c.width, height: c.height };
+      const r = det.detect(frame as unknown as ImageData, {});
+      const gt = r.hb && r.corners ? alignGt(gtStart(edge), c.gt, r.hb) : null;
+      if (!r.hb || !gt) {
+        lines.push(`${c.name}: no aligned detection`);
+        continue;
+      }
+      n++;
+      const tr = new OccupancyTracker();
+      let out = tr.update(frame, r.hb, {}, 0);
+      for (let t = 1; t < 5; t++) out = tr.update(frame, r.hb, {}, t * 100);
+      // Steady-state cost per frame once calibrated (the worker's per-frame budget is < 3 ms).
+      for (let t = 5; t < 25; t++) {
+        const t0 = performance.now();
+        tr.update(frame, r.hb, {}, t * 100);
+        times.push(performance.now() - t0);
+      }
+      if (out.stats.state === 'calibrated') boots++;
+      let rawOk = 0;
+      for (let k = 0; k < 64; k++) if (out.raw[k] === gt[k]) rawOk++;
+      rawSum += rawOk / 64;
+      let gridOk = -1;
+      if (out.grid) {
+        gridOk = 0;
+        for (let k = 0; k < 64; k++) if (out.grid[k] === gt[k]) gridOk++;
+        gridSum += gridOk / 64;
+        grids++;
+      }
+      lines.push(`${c.name}: ${out.stats.state} raw ${rawOk}/64 grid ${out.grid ? `${gridOk}/64` : 'dropped'} low ${out.stats.lowCells}`);
+    }
+    times.sort((a, b) => a - b);
+    const med = times[times.length >> 1] ?? NaN;
+    console.log(lines.join('\n'));
+    console.log(`real start: n=${n} calibrated ${boots} raw acc ${((rawSum / Math.max(1, n)) * 100).toFixed(1)}% grid acc ${((gridSum / Math.max(1, grids)) * 100).toFixed(1)}% (${grids} not dropped); update median ${med.toFixed(2)} ms p90 ${times[Math.floor(times.length * 0.9)]?.toFixed(2)} ms max ${times[times.length - 1]?.toFixed(2)} ms`);
+    expect(n).toBeGreaterThanOrEqual(4);
+    expect(boots).toBeGreaterThanOrEqual(4);
+    expect(rawSum / n).toBeGreaterThanOrEqual(0.9);
+    expect(med).toBeLessThan(10); // loose: CI machines vary; the target is < 3 ms
   }, 120_000);
 });

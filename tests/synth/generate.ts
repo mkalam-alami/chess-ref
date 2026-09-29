@@ -365,7 +365,7 @@ function renderBoard(rng: Rng, img: Float32Array, hb: Mat3, style: BoardStyle): 
 }
 
 /** Starting position: light pieces on rows 0-1, dark on rows 6-7, with realistic heights and radii (cells). */
-function drawStart(rng: Rng, img: Float32Array, cam: Camera, gt: Uint8Array): void {
+function drawStart(rng: Rng, img: Float32Array, cam: Camera, gt: Uint8Array, moves: ReadonlyArray<readonly [number, number]> = []): void {
   const back: Array<[number, number]> = [[1.05, 0.37], [1.25, 0.37], [1.4, 0.36], [1.55, 0.39], [1.7, 0.39], [1.4, 0.36], [1.25, 0.37], [1.05, 0.37]];
   const chosen: Array<{ x: number; y: number; h: number; r: number; light: boolean; depth: number }> = [];
   for (const j of [0, 1, 6, 7])
@@ -374,9 +374,21 @@ function drawStart(rng: Rng, img: Float32Array, cam: Camera, gt: Uint8Array): vo
       const [h, r] = pawn ? [0.95, 0.32] : back[i]!;
       const x = i - 3.5 + (rng() - 0.5) * 0.12;
       const y = j - 3.5 + (rng() - 0.5) * 0.12;
-      gt[j * 8 + i] = j < 2 ? 1 : 2;
-      chosen.push({ x, y, h: h * (0.95 + rng() * 0.1), r, light: j < 2, depth: cam.project(x, y, 0)[2] });
+      chosen.push({ x, y, h: h * (0.95 + rng() * 0.1), r, light: j < 2, depth: 0 });
     }
+  const cellOf = (p: { x: number; y: number }) => Math.round(p.y + 3.5) * 8 + Math.round(p.x + 3.5);
+  for (const [from, to] of moves) {
+    const cap = chosen.findIndex((p) => cellOf(p) === to);
+    if (cap >= 0) chosen.splice(cap, 1);
+    const p = chosen.find((q) => cellOf(q) === from);
+    if (!p) throw new Error(`no piece on cell ${from}`);
+    p.x += (to & 7) - (from & 7);
+    p.y += (to >> 3) - (from >> 3);
+  }
+  for (const p of chosen) {
+    gt[cellOf(p)] = p.light ? 1 : 2;
+    p.depth = cam.project(p.x, p.y, 0)[2];
+  }
   chosen.sort((a, b) => b.depth - a.depth);
   for (const p of chosen) drawPiece(rng, img, cam, p.x, p.y, p.r, p.h, p.r * 0.55, p.light);
 }
@@ -532,7 +544,12 @@ function degrade(cv: CV, rng: Rng, rgb: Float32Array, meta: Record<string, numbe
 }
 
 /** Renders a board sample; deterministic for a given seed. */
-export function makeBoardSample(cv: CV, seed: number, spec: SampleSpec): Sample {
+/**
+ * `moves` (only with pieces 'start'): cell moves [from, to] (cell (i, j) at j * 8 + i) applied in order to the
+ * starting position; a move onto an occupied cell captures. The camera, board, lighting and noise are those of the
+ * plain 'start' sample of the same seed, so a sequence of calls renders a game seen from a fixed camera.
+ */
+export function makeBoardSample(cv: CV, seed: number, spec: SampleSpec, moves: ReadonlyArray<readonly [number, number]> = []): Sample {
   const rng = mulberry32(seed * 7919 + 13);
   const U = (a: number, b: number) => a + (b - a) * rng();
   const style = makeStyle(rng, spec.palette);
@@ -584,7 +601,7 @@ export function makeBoardSample(cv: CV, seed: number, spec: SampleSpec): Sample 
   const occupancy = new Uint8Array(64);
   if (spec.pieces === 'start') {
     // Own RNG stream so the lighting and noise below match the 'none' sample of the same seed.
-    drawStart(mulberry32(seed * 131 + 5), img, cam, occupancy);
+    drawStart(mulberry32(seed * 131 + 5), img, cam, occupancy, moves);
     meta.pieces = 32;
   } else {
     const nPieces = spec.pieces === 'none' ? 0 : spec.pieces === 'outer' ? Math.floor(U(14, 33)) : Math.floor(U(8, 33));
