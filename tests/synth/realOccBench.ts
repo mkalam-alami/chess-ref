@@ -20,7 +20,7 @@
  * Images without a GT entry are reported detection/boot only; `neg-*` files (corners: null) as false positives.
  *
  * Groups: tests/fixtures/real is "orig"; other directories take `view` (oblique / topdown) and `split`
- * (tune / holdout) from their SOURCES.json ([{file, view, split, ...}], or {images: [...]}, or keyed by file);
+ * (tune / holdout; "excluded" images are skipped entirely) from their SOURCES.json ([{file, view, split, ...}], or {images: [...]}, or keyed by file);
  * without SOURCES.json every image is tune with view "unknown".
  *
  * Environment:
@@ -167,9 +167,15 @@ function listImages(dirs: string[], holdout: string | undefined, filter: string 
     const orig = path.basename(dir) === 'real' && !sources;
     if (!sources && !orig) log.push(`[note] ${rel}: no SOURCES.json, all images treated as tune (view unknown)`);
     let skippedHoldout = 0;
+    let skippedExcluded = 0;
     for (const file of fs.readdirSync(dir).filter((f) => /\.jpe?g$/i.test(f)).sort()) {
       if (filter && !file.includes(filter)) continue;
       const s = sources?.get(file);
+      // Unusable images (not a starting position, ...) stay in SOURCES.json with split "excluded": never run.
+      if (s?.split === 'excluded') {
+        skippedExcluded++;
+        continue;
+      }
       const split: Split = s?.split === 'holdout' ? 'holdout' : 'tune';
       if (!gridOnly) {
         if (split === 'holdout' && holdout !== '1' && holdout !== 'only') {
@@ -181,6 +187,7 @@ function listImages(dirs: string[], holdout: string | undefined, filter: string 
       const view = orig ? 'orig' : (s?.view ?? 'unknown');
       metas.push({ dir, file, key: `${rel}/${file}`, group: orig ? 'orig' : `${view}/${split}`, view, split });
     }
+    if (skippedExcluded) log.push(`[excluded] ${rel}: ${skippedExcluded} image(s) with split "excluded" skipped`);
     if (skippedHoldout) log.push(`[holdout] ${rel}: ${skippedHoldout} holdout image(s) excluded (REALOCC_HOLDOUT=1 to include)`);
   }
   return { metas, corners };
