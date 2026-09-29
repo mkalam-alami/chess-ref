@@ -2,9 +2,10 @@ import type { GameEvent } from '../game/types';
 
 /**
  * Move sounds, synthesised with the Web Audio API (no audio files: nothing to license or download).
- * - move: a piece set down on a wooden board, a short band-passed noise burst (the contact) over a low damped
- *   resonance (the board), about 110 ms;
- * - capture: the same knock, doubled (the captured piece taken off, the capturing one set down);
+ * - move: a piece set down on a wooden board, two quick knocks (contact, then the piece settling), each a
+ *   band-passed noise burst over a damped resonance, about 180 ms. Pitched high enough for phone speakers, which
+ *   drop most energy below ~300 Hz (a single low knock was inaudible on a phone);
+ * - capture: a busier triple knock (the captured piece taken off, the capturing one set down and settling);
  * - click: a small, quiet tick for corrections (revisions, takebacks, undo).
  * Mobile browsers only allow audio after a user gesture: `unlock()` must be called from one (the Start tap). Every
  * failure is silent.
@@ -28,7 +29,9 @@ export function soundFor(events: readonly GameEvent[]): SoundKind | null {
 /** Minimum time between two sounds (s): a burst of events never stacks knocks. */
 export const MIN_GAP_S = 0.06;
 /** Master volume (0..1). */
-export const VOLUME = 0.8;
+export const VOLUME = 0.9;
+/** Pitch factor of the move / capture knocks (1 = the original low knock). */
+export const MOVE_PITCH = 1.5;
 
 /** The parts of AudioContext used here (a mock in tests). */
 export type AudioLike = Pick<
@@ -86,9 +89,13 @@ export class SoundPlayer {
       const t0 = t + 0.005;
       if (kind === 'click') {
         this.click(ctx, out, t0);
+      } else if (kind === 'move') {
+        this.knock(ctx, out, t0, 1, MOVE_PITCH);
+        this.knock(ctx, out, t0 + 0.07, 0.8, MOVE_PITCH * 1.15);
       } else {
-        this.knock(ctx, out, t0, 1);
-        if (kind === 'capture') this.knock(ctx, out, t0 + 0.07, 0.8, 1.15);
+        this.knock(ctx, out, t0, 1, MOVE_PITCH * 0.9);
+        this.knock(ctx, out, t0 + 0.055, 0.9, MOVE_PITCH * 1.1);
+        this.knock(ctx, out, t0 + 0.12, 0.7, MOVE_PITCH * 1.25);
       }
       return true;
     } catch {
@@ -142,7 +149,7 @@ export class SoundPlayer {
   /** A piece set down on wood: contact noise, a hollow mid knock and the board's low thump. `pitch` scales it. */
   private knock(ctx: AudioLike, out: AudioNode, t: number, level: number, pitch = 1): void {
     this.noiseBurst(ctx, out, t, 'bandpass', 1500 * pitch, 1.2, 0.5 * level, 0.05);
-    this.tone(ctx, out, t, 'triangle', 620 * pitch, 480 * pitch, 0.18 * level, 0.045);
+    this.tone(ctx, out, t, 'triangle', 620 * pitch, 480 * pitch, 0.3 * level, 0.045);
     this.tone(ctx, out, t, 'sine', 210 * pitch, 130 * pitch, 0.6 * level, 0.11);
   }
 
