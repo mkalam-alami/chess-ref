@@ -1,7 +1,8 @@
 // Entry of `npm run bench` (see vitest.bench.config.ts). Environment: BENCH_N (samples per category), BENCH_SEED,
 // BENCH_FILTER (substring of the category label), BENCH_DUMP (max failure PNGs per run),
 // BENCH_OCC=0 skips occupancy, BENCH_OCC_N (samples per occupancy category),
-// BENCH_PARAMS (JSON of parameter overrides, e.g. {"refine":0}), BENCH_ONLY=real|synth, BENCH_VERBOSE=1.
+// BENCH_PARAMS (JSON of parameter overrides, e.g. {"refine":0}), BENCH_ONLY=real|synth|track, BENCH_VERBOSE=1,
+// BENCH_TRACK=0 skips the tracking-mode pipeline timings, BENCH_TRACK_N (frames per tracking clip).
 import path from 'node:path';
 import fs from 'node:fs';
 import { test } from 'vitest';
@@ -9,6 +10,7 @@ import { Detector } from '../../src/vision/detector';
 import { encodePng } from './png';
 import { loadCv } from './cvNode';
 import { occupancyBench } from './occBench';
+import { trackingBench } from './trackBench';
 import { dumpFailure, formatTable, negativeCases, realCases, recallWhere, runCases, runCasesLocked, summarize, synthCases, type Outcome } from './bench';
 
 const OUT = path.resolve(import.meta.dirname, 'out');
@@ -31,14 +33,23 @@ test('bench', async () => {
   }
   const det = new Detector(cv);
   const t0 = Date.now();
-  const only = process.env.BENCH_ONLY; // 'real' | 'synth'
+  const only = process.env.BENCH_ONLY; // 'real' | 'synth' | 'track'
+  const benchParams = JSON.parse(process.env.BENCH_PARAMS ?? '{}') as Record<string, number>;
+  const track = () => {
+    const t1 = Date.now();
+    console.log(`\n${trackingBench(cv, det, Number(process.env.BENCH_TRACK_N ?? 30), seed, benchParams)}  [${((Date.now() - t1) / 1000).toFixed(1)}s]`);
+  };
+  if (only === 'track') {
+    track();
+    det.dispose();
+    return;
+  }
   const cases = [
     ...(only === 'real' ? [] : synthCases(cv, n, seed, filter ? (s) => `${s.elev}-${s.palette}-${s.pieces}`.includes(filter) : undefined)),
     ...(filter || only === 'real' ? [] : negativeCases(cv)),
     ...(filter || only === 'synth' ? [] : [...realCases(cv, 640), ...realCases(cv, 800)]),
   ];
   const genSec = (Date.now() - t0) / 1000;
-  const benchParams = JSON.parse(process.env.BENCH_PARAMS ?? '{}') as Record<string, number>;
   const outs: Outcome[] = runCases(det, cases, benchParams, true);
   if (process.env.BENCH_LOCKED) {
     // Locked-profile run: see runCasesLocked. Prints the locked table, per-stage means and the profiles.
@@ -91,6 +102,7 @@ test('bench', async () => {
     const nOcc = Number(process.env.BENCH_OCC_N ?? 6);
     console.log(`\noccupancy (start calibration, then 1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Bxc6 from the same camera):\n${occupancyBench(cv, det, nOcc, seed + 50000)}  [${((Date.now() - t1) / 1000).toFixed(1)}s]`);
   }
+  if (!filter && only !== 'real' && process.env.BENCH_TRACK !== '0') track();
   fs.rmSync(OUT, { recursive: true, force: true });
   let dumped = 0;
   const files: string[] = [];
