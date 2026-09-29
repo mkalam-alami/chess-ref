@@ -1,4 +1,5 @@
 import type { GameSnapshot, PlyInfo } from '../game/types';
+import { displayPlies, pendingKey, pendingProgress } from './pending';
 
 /** How long a corrected ply flashes (ms, observation clock). */
 export const FLASH_MS = 1500;
@@ -51,7 +52,7 @@ export function flashAge(ply: PlyInfo, now: number): number | null {
 
 /** Everything the sidebar shows; re-rendered only when this changes. */
 function renderKey(s: GameSnapshot): string {
-  return JSON.stringify([s.state, s.turn, s.check, s.result, s.plies.map((p) => [p.san, p.tentative, p.correctedAt, p.promotion])]);
+  return JSON.stringify([s.state, s.turn, s.check, s.result, s.plies.map((p) => [p.san, p.tentative, p.correctedAt, p.promotion]), pendingKey(s.pending)]);
 }
 
 export type Promotion = 'q' | 'r' | 'b' | 'n';
@@ -62,6 +63,8 @@ export interface MoveListActions {
   newGame(): void;
   continueAfterDesync(): void;
   promote(ply: number, piece: Promotion): void;
+  /** Toggles the sound; returns whether it is now muted. */
+  toggleMute(): boolean;
 }
 
 const COLLAPSED_KEY = 'chess-ref.movesCollapsed';
@@ -94,7 +97,9 @@ export class MoveList {
   private copyBtn: HTMLButtonElement;
   private undoBtn: HTMLButtonElement;
   private newBtn: HTMLButtonElement;
+  private soundBtn: HTMLButtonElement;
   private key = '';
+  private progress = -1;
   private promoPly = -1;
 
   constructor(
@@ -109,6 +114,8 @@ export class MoveList {
     this.copyBtn = $(root, '.mv-copy');
     this.undoBtn = $(root, '.mv-undo');
     this.newBtn = $(root, '.mv-new');
+    this.soundBtn = $(root, '.mv-sound');
+    this.soundBtn.addEventListener('click', () => this.setMuted(actions.toggleMute()));
     this.copyBtn.addEventListener('click', () => actions.copy());
     this.undoBtn.addEventListener('click', () => actions.undo());
     this.newBtn.addEventListener('click', () => actions.newGame());
@@ -141,8 +148,19 @@ export class MoveList {
     saveCollapsed(on);
   }
 
-  /** Updates the sidebar; `now` is the latest observation time (the clock of PlyInfo.correctedAt). */
+  /** Shows the sound toggle's state. */
+  setMuted(muted: boolean): void {
+    this.soundBtn.textContent = muted ? 'Sound off' : 'Sound on';
+    this.soundBtn.setAttribute('aria-pressed', String(!muted));
+    this.soundBtn.classList.toggle('off', muted);
+  }
+
+  /**
+   * Updates the sidebar; `now` is the latest observation time (the clock of PlyInfo.correctedAt). The list is rebuilt
+   * only when what it shows changes (the pending line included); the pending progress is a style update.
+   */
   render(s: GameSnapshot, now: number): void {
+    this.setPendingProgress(pendingProgress(s.pending));
     const key = renderKey(s);
     if (key === this.key) return;
     this.key = key;
@@ -154,13 +172,19 @@ export class MoveList {
     this.newBtn.disabled = s.state === 'waiting';
     this.closePromo();
 
+    const shown = displayPlies(s.plies, s.pending);
+    // The last committed ply keeps its highlight unless the pending change replaces it.
     const last = s.plies.length - 1;
     const plyEl = (i: number) => {
-      const p = s.plies[i]!;
+      const { ply: p, mark } = shown[i]!;
       const el = document.createElement('span');
       el.className = 'mv-ply';
-      el.dataset.ply = String(i);
       el.textContent = p.san;
+      if (mark !== 'committed') {
+        el.classList.add(mark);
+        return el;
+      }
+      el.dataset.ply = String(i);
       if (i === last) el.classList.add('last');
       if (p.tentative) el.classList.add('tentative');
       if (p.promotion) {
@@ -176,7 +200,7 @@ export class MoveList {
       }
       return el;
     };
-    const rows = movePairs(s.plies).map((m) => {
+    const rows = movePairs(shown.map((d) => d.ply)).map((m) => {
       const row = document.createElement('div');
       row.className = 'mv-row';
       const no = document.createElement('span');
@@ -194,6 +218,14 @@ export class MoveList {
     }
     this.list.replaceChildren(...rows);
     this.list.scrollTop = this.list.scrollHeight;
+  }
+
+  /** Pending progress (0..1) as a CSS variable on the list, which the pending plies' style reads (cheap). */
+  setPendingProgress(p: number): void {
+    const q = Math.round(p * 20) / 20;
+    if (q === this.progress) return;
+    this.progress = q;
+    this.list.style.setProperty('--pending', String(q));
   }
 
   /** Shows the PGN selected in a text box (clipboard fallback). */

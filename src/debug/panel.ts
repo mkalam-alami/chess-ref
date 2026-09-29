@@ -1,5 +1,5 @@
 import type { CameraInfo } from '../camera';
-import type { GameSnapshot } from '../game/types';
+import type { ChangeTiming, GameSnapshot } from '../game/types';
 import { DOT_LOW_CONF } from '../overlay';
 import { DEBUG_VIEWS, type DebugView, type OccupancyStats, type Params } from '../worker/protocol';
 
@@ -61,6 +61,8 @@ export interface DebugStats {
   occupancy?: string;
   /** Pre-formatted game lines (see formatGame). */
   game?: string;
+  /** Pre-formatted latency lines (see formatTiming). */
+  latency?: string;
 }
 
 /** Game summary for the stats block: state, side to move and ply count, ' (not framed)' while the last observation's
@@ -72,6 +74,22 @@ export function formatGame(s: Pick<GameSnapshot, 'state' | 'turn' | 'plies' | 't
     out += `${k === 0 ? '  top ' : '      '}${(h.line || '(anchor)').padEnd(12)}${Number.isFinite(h.score) ? h.score.toFixed(1) : String(h.score)}\n`;
   });
   return out;
+}
+
+/**
+ * Latency timeline of the last committed change: when the board settled (stable), when the committed line became the
+ * favourite and when it committed, in ms after the hand left (unstableEndAt), or after it became the favourite when
+ * no unstable frame preceded it. E.g. 'commit  advance (from hand off)\n        stable +80 fav +150 commit +420 ms\n'.
+ */
+export function formatTiming(t: ChangeTiming | null | undefined): string {
+  if (!t) return 'commit  -\n';
+  const base = t.unstableEndAt ?? t.favouriteAt;
+  const rel = (v: number) => {
+    const d = Math.round(v - base);
+    return Number.isFinite(d) ? `${d < 0 ? '-' : '+'}${Math.abs(d)}` : '?';
+  };
+  const parts = [...(t.stableAt === null ? [] : [`stable ${rel(t.stableAt)}`]), `fav ${rel(t.favouriteAt)}`, `commit ${rel(t.committedAt)}`];
+  return `commit  ${t.kind} (from ${t.unstableEndAt === null ? 'favourite' : 'hand off'})\n        ${parts.join(' ')} ms\n`;
 }
 
 /**
@@ -228,7 +246,8 @@ export class DebugPanel {
       `render  ${s.fps.toFixed(0)} fps\ndetect  ${s.detectionsPerSec.toFixed(1)} /s\n` +
       `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n` +
       (s.occupancy ?? '') +
-      (s.game ?? '');
+      (s.game ?? '') +
+      (s.latency ?? '');
 
     // Build timing rows with fading for irrelevant phases
     const timingLines: string[] = [];

@@ -37,6 +37,14 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   await expect(moves).toBeVisible();
   await expect(moves.locator('.mv-status')).not.toBeEmpty();
   await expect(moves.locator('.mv-copy')).toBeVisible();
+  // The sound toggle mutes and unmutes (persisted); the audio context was created on the Start tap without errors.
+  const soundBtn = moves.locator('.mv-sound');
+  await expect(soundBtn).toHaveAttribute('aria-pressed', 'true');
+  await soundBtn.click();
+  await expect(soundBtn).toHaveAttribute('aria-pressed', 'false');
+  expect(await page.evaluate(() => localStorage.getItem('chess-ref.muted'))).toBe('1');
+  await soundBtn.click();
+  await expect(soundBtn).toHaveAttribute('aria-pressed', 'true');
   // Collapsing keeps only the toggle; expanding restores the list.
   await moves.locator('.mv-toggle').click();
   await expect(moves.locator('.mv-copy')).toBeHidden();

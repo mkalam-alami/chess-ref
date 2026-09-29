@@ -10,15 +10,17 @@ import {
   type CameraInfo,
   type FrameSource,
 } from './camera';
-import { DebugPanel, fillCameraSelect, formatGame, formatOccupancy, getParams, registerParam } from './debug/panel';
+import { DebugPanel, fillCameraSelect, formatGame, formatOccupancy, formatTiming, getParams, registerParam } from './debug/panel';
 import { GameTracker } from './game/game';
 import type { GameEvent, GameSnapshot } from './game/types';
 import { isSimpleQuad } from './geom/cornerOrder';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS, visibleFrameRect } from './overlay';
 import { MoveList, statusText } from './ui/moves';
+import { pendingBoard, pendingKey, pendingProgress } from './ui/pending';
 import { pieceImage, preloadPieces } from './ui/pieces';
-import { archivePgn, loadSavedGame, saveGame, unarchiveLast } from './ui/storage';
+import { SoundPlayer } from './ui/sound';
+import { archivePgn, loadMuted, loadSavedGame, saveGame, saveMuted, unarchiveLast } from './ui/storage';
 import { ALL_PARAMS } from './vision/detector';
 import { describeProfile } from './vision/profile';
 import type { FrameMessage, OccupancyStats, ResultMessage, WorkerToMain } from './worker/protocol';
@@ -178,6 +180,8 @@ const gameChip = $('gameChip');
 let framed = true;
 const FRAMING_TEXT = 'Keep the whole board in view';
 
+const sound = new SoundPlayer(loadMuted());
+
 const moves = new MoveList($('moves'), {
   copy: () => void copyPgn(),
   undo: () => handleGameEvents(game.undo(), true),
@@ -197,7 +201,15 @@ const moves = new MoveList($('moves'), {
     if (!game.setPromotion(ply, piece)) showNotice('That promotion is not possible here.');
     handleGameEvents([], true);
   },
+  toggleMute: () => {
+    sound.muted = !sound.muted;
+    saveMuted(sound.muted);
+    // A tap is a user gesture: the moment to (re)create the audio context if Start did not manage to.
+    if (!sound.muted) sound.unlock();
+    return sound.muted;
+  },
 });
+moves.setMuted(sound.muted);
 
 function pgnHeaders(): Record<string, string> {
   const d = new Date();
@@ -247,12 +259,24 @@ function sendHint(): void {
 function handleGameEvents(events: GameEvent[], changed = false): void {
   const prevState = snapshot.state;
   if (events.length === 0 && !changed) {
-    // Nothing happened, but snapshots also carry debug scores: refresh them only while the panel shows them.
-    if (panel.visible) snapshot = game.snapshot();
+    // Nothing committed, but snapshots also carry the pending change (optimistic display) and debug scores: refresh
+    // while a game is on or the panel shows them. Only the pending display is updated; the sidebar list is
+    // rebuilt only when the pending line changes (its progress is a style update).
+    if (panel.visible || snapshot.state !== 'waiting') {
+      const prevPending = pendingKey(snapshot.pending);
+      const hadPending = snapshot.pending !== null;
+      snapshot = game.snapshot();
+      if (hadPending || snapshot.pending) {
+        if (pendingKey(snapshot.pending) !== prevPending) moves.render(snapshot, obsTime);
+        else moves.setPendingProgress(pendingProgress(snapshot.pending));
+        renderOverlayGame();
+      }
+    }
     return;
   }
   const prevSave = savedGame;
   snapshot = game.snapshot();
+  sound.playFor(events);
   for (const e of events) {
     if (e.type === 'newGame') {
       archivePgn(e.previousPgn);
@@ -268,9 +292,14 @@ function handleGameEvents(events: GameEvent[], changed = false): void {
 function renderGame(): void {
   app.dataset.game = snapshot.state;
   moves.render(snapshot, obsTime);
-  overlay.setGame(snapshot.state === 'waiting' ? null : { pieces: snapshot.pieces, lastMove: snapshot.lastMove });
+  renderOverlayGame();
   renderChip();
   sendHint();
+}
+
+function renderOverlayGame(): void {
+  const s = snapshot;
+  overlay.setGame(s.state === 'waiting' ? null : { pieces: s.pieces, lastMove: s.lastMove, pending: pendingBoard(s), pendingProgress: pendingProgress(s.pending) });
 }
 
 /** Status chip text: the framing request while the board is not wholly in view, else the game status. */
@@ -418,7 +447,11 @@ async function startCameraSource(requested: string | null | undefined, explicit:
   await refreshCameras();
 }
 
-$('startBtn').addEventListener('click', () => void startCameraSource(undefined, false, true));
+$('startBtn').addEventListener('click', () => {
+  // The tap is the user gesture mobile browsers require before any audio.
+  sound.unlock();
+  void startCameraSource(undefined, false, true);
+});
 // On the start screen the choice only takes effect when Start is tapped.
 cameraSelect.addEventListener('change', () => saveCameraId(cameraSelect.value || null));
 panel.onCameraChange((id) => {
@@ -476,7 +509,7 @@ function loop(now: number): void {
     renderChip();
     gameChip.hidden = panel.visible || (framed && snapshot.state !== 'waiting');
     overlay.draw(now, lastFrameW || source.width, lastFrameH || source.height);
-    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), game: formatGame(snapshot, framed), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
+    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), game: formatGame(snapshot, framed), latency: formatTiming(snapshot.lastTiming), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
   }
   requestAnimationFrame(loop);
 }

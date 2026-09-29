@@ -42,11 +42,15 @@
     .mv-ply { flex: 1; min-width: 0; padding: 0 2px; border-radius: 3px; overflow: hidden; text-overflow: ellipsis; }
     .mv-ply.last { background: rgba(255,214,0,.35); }
     .mv-ply.tentative { font-style: italic; opacity: .6; }
+    /* Pending (not yet committed) plies: faint, dotted, filling up with --pending (0..1, the commit progress). */
+    .mv-ply.pending { font-style: italic; opacity: calc(.35 + .4 * var(--pending, 0)); text-decoration: underline dotted; background: linear-gradient(to right, rgba(255,255,255,.2) calc(var(--pending, 0) * 100%), transparent 0); }
+    .mv-ply.dropped { opacity: .4; text-decoration: line-through; }
     .mv-ply.promo { text-decoration: underline dotted; cursor: pointer; }
     .mv-ply.flash { animation: mv-flash 1.5s ease-out; }
     @keyframes mv-flash { from { background: rgba(255,82,82,.9); } to { background: transparent; } }
     .mv-result { justify-content: center; font-weight: 600; }
     .mv-actions { display: flex; flex-direction: column; gap: 4px; }
+    #moves .mv-sound.off { opacity: .6; }
     .mv-promo { position: absolute; left: 6px; right: 6px; z-index: 1; display: flex; gap: 4px; padding: 4px; border-radius: 6px; background: rgba(20,20,20,.95); }
     .mv-promo button { flex: 1; }
     .mv-pgn { position: absolute; left: 6px; right: 6px; bottom: 6px; height: 50%; box-sizing: border-box; font: .75rem ui-monospace, monospace; background: #111; color: #eee; border: 1px solid #555; border-radius: 6px; }
@@ -76,7 +80,7 @@
       <div class="mv-desync" hidden><button class="mv-desync-undo" type="button">Undo</button><button class="mv-desync-continue" type="button">Continue</button></div>
       <div class="mv-list"></div>
       <div class="mv-promo" hidden><button type="button" data-piece="q">Q</button><button type="button" data-piece="r">R</button><button type="button" data-piece="b">B</button><button type="button" data-piece="n">N</button></div>
-      <div class="mv-actions"><button class="mv-copy" type="button">Copy PGN</button><button class="mv-undo" type="button">Undo</button><button class="mv-new" type="button">New game</button></div>
+      <div class="mv-actions"><button class="mv-copy" type="button">Copy PGN</button><button class="mv-undo" type="button">Undo</button><button class="mv-new" type="button">New game</button><button class="mv-sound" type="button" aria-pressed="true">Sound on</button></div>
       <textarea class="mv-pgn" readonly hidden aria-label="PGN"></textarea>
     </aside>
     <div id="start">

@@ -2,6 +2,7 @@ import { applyH, homographyFrom4, type Point } from './geom/homography';
 import { BOARD_CORNERS, signedArea } from './geom/cornerOrder';
 import { OCC_BLACK, OCC_WHITE } from './worker/protocol';
 import type { PieceCode } from './game/types';
+import type { PendingBoard } from './ui/pending';
 
 export interface CoverMap {
   scale: number;
@@ -185,6 +186,13 @@ export const PIECE_BASE = 0.32;
 /** Icon opacity at full quad alpha (slightly translucent so the real board shows through). */
 export const PIECE_ALPHA = 0.85;
 export const LAST_MOVE_TINT = 'rgba(255, 214, 0, 0.38)';
+/** Faint tint of the pending (not yet committed) move's cells. */
+export const PENDING_TINT = 'rgba(255, 255, 255, 0.22)';
+/** Ghost (pending destination) icon opacity at pending progress 0 and 1, relative to the quad alpha. */
+export const GHOST_ALPHA_MIN = 0.25;
+export const GHOST_ALPHA_MAX = 0.5;
+/** Opacity of a piece the pending change would move or capture, relative to the quad alpha. */
+export const DIM_ALPHA = 0.3;
 
 export interface PieceMark {
   /** Chess square (a1 = 0). */
@@ -194,12 +202,16 @@ export interface PieceMark {
   x: number;
   y: number;
   size: number;
+  /** Pending change: 'dim' for a piece it would move away / capture, 'ghost' for where it would put a piece. */
+  state?: 'dim' | 'ghost';
 }
 
 export interface GameMarks {
   pieces: PieceMark[];
   /** Screen polygons of the last move's from / to cells. */
   tint: Point[][];
+  /** Screen polygons of the pending move's from / to cells. */
+  pendingTint: Point[][];
 }
 
 /** Board cell (i, j) of a chess square under the orientation map (ResultMessage.orientation), or null if invalid. */
@@ -214,39 +226,50 @@ function squareCell(orientation: ArrayLike<number>, sq: number): [number, number
  * icon box per occupied square, sized by the projected cell size (as in occupancyDots) and anchored with its bottom
  * edge slightly below the cell centre, plus the last move's cells as polygons. `pieces` is in chess square order and
  * square sq lies on board cell orientation[sq]. Pieces are sorted far-to-near (by screen y) so nearer icons overlap
- * farther ones. Returns empty marks for a degenerate quad or malformed arrays.
+ * farther ones. With a `pending` board (see pendingBoard), pieces it moves away or captures are marked 'dim', the
+ * pieces it puts down are added as 'ghost' marks, and its cells go to `pendingTint`. Returns empty marks for a
+ * degenerate quad or malformed arrays.
  */
 export function gameMarks(
   corners: readonly Point[],
   orientation: ArrayLike<number>,
   pieces: ReadonlyArray<PieceCode | null>,
   lastMove: { from: number; to: number } | null = null,
+  pending: PendingBoard | null = null,
 ): GameMarks {
-  const out: GameMarks = { pieces: [], tint: [] };
+  const out: GameMarks = { pieces: [], tint: [], pendingTint: [] };
   if (corners.length !== 4 || orientation.length !== 64 || pieces.length !== 64) return out;
   const h = homographyFrom4(BOARD_CORNERS, corners);
   if (!h) return out;
   const cellPoly = ([i, j]: [number, number]): Point[] => [applyH(h, [i, j]), applyH(h, [i + 1, j]), applyH(h, [i + 1, j + 1]), applyH(h, [i, j + 1])];
+  const after = pending && pending.pieces.length === 64 ? pending.pieces : null;
   for (let sq = 0; sq < 64; sq++) {
     const code = pieces[sq];
-    if (!code) continue;
+    const next = after ? after[sq] : null;
+    const ghost = next && next !== code ? next : null;
+    if (!code && !ghost) continue;
     const ij = squareCell(orientation, sq);
     if (!ij) continue;
     const cell = Math.sqrt(Math.abs(signedArea(cellPoly(ij))));
     const [cx, cy] = applyH(h, [ij[0] + 0.5, ij[1] + 0.5]);
     if (!Number.isFinite(cell) || !Number.isFinite(cx) || !Number.isFinite(cy) || cell <= 0) continue;
     const size = cell * PIECE_SIZE;
-    out.pieces.push({ sq, code, x: cx - size / 2, y: cy + cell * PIECE_BASE - size, size });
+    const box = { sq, x: cx - size / 2, y: cy + cell * PIECE_BASE - size, size };
+    if (code) out.pieces.push(after && after[sq] !== code ? { ...box, code, state: 'dim' } : { ...box, code });
+    if (ghost) out.pieces.push({ ...box, code: ghost, state: 'ghost' });
   }
+  // Stable sort: on a shared square the ghost stays above the piece it would capture.
   out.pieces.sort((a, b) => a.y - b.y);
-  if (lastMove) {
-    for (const sq of [lastMove.from, lastMove.to]) {
+  const tintCells = (squares: number[], into: Point[][]) => {
+    for (const sq of squares) {
       const ij = squareCell(orientation, sq);
       if (!ij) continue;
       const poly = cellPoly(ij);
-      if (poly.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y))) out.tint.push(poly);
+      if (poly.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y))) into.push(poly);
     }
-  }
+  };
+  if (lastMove) tintCells([lastMove.from, lastMove.to], out.tint);
+  if (after) tintCells([...new Set(pending!.squares)], out.pendingTint);
   return out;
 }
 
@@ -255,21 +278,31 @@ export type PieceImages = (code: PieceCode) => CanvasImageSource | null;
 
 const GLYPHS: Record<string, string> = { P: '\u265F', N: '\u265E', B: '\u265D', R: '\u265C', Q: '\u265B', K: '\u265A' };
 
-export function drawGameMarks(ctx: CanvasRenderingContext2D, marks: GameMarks, alpha: number, images: PieceImages): void {
+/** Opacity of a ghost icon at pending progress `progress` (0..1). */
+export function ghostAlpha(progress: number): number {
+  const p = Number.isFinite(progress) ? Math.max(0, Math.min(1, progress)) : 0;
+  return GHOST_ALPHA_MIN + (GHOST_ALPHA_MAX - GHOST_ALPHA_MIN) * p;
+}
+
+export function drawGameMarks(ctx: CanvasRenderingContext2D, marks: GameMarks, alpha: number, images: PieceImages, pendingProgress = 0): void {
   if (alpha <= 0) return;
   ctx.save();
+  const fillPolys = (polys: Point[][], style: string) => {
+    ctx.fillStyle = style;
+    for (const poly of polys) {
+      ctx.beginPath();
+      poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1])));
+      ctx.closePath();
+      ctx.fill();
+    }
+  };
   ctx.globalAlpha = alpha;
-  ctx.fillStyle = LAST_MOVE_TINT;
-  for (const poly of marks.tint) {
-    ctx.beginPath();
-    poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1])));
-    ctx.closePath();
-    ctx.fill();
-  }
-  ctx.globalAlpha = alpha * PIECE_ALPHA;
+  fillPolys(marks.tint, LAST_MOVE_TINT);
+  fillPolys(marks.pendingTint, PENDING_TINT);
   ctx.shadowColor = 'rgba(0,0,0,0.5)';
   ctx.shadowBlur = 3;
   for (const m of marks.pieces) {
+    ctx.globalAlpha = alpha * (m.state === 'ghost' ? ghostAlpha(pendingProgress) : m.state === 'dim' ? DIM_ALPHA : PIECE_ALPHA);
     const img = images(m.code);
     if (img) {
       ctx.drawImage(img, m.x, m.y, m.size, m.size);
@@ -295,6 +328,10 @@ export function drawGameMarks(ctx: CanvasRenderingContext2D, marks: GameMarks, a
 export interface OverlayGame {
   pieces: ReadonlyArray<PieceCode | null>;
   lastMove: { from: number; to: number } | null;
+  /** The pending (not yet committed) change's board, drawn as ghosts; null / absent when there is none. */
+  pending?: PendingBoard | null;
+  /** Its progress towards committing (0..1): ghosts get more opaque as it grows. */
+  pendingProgress?: number;
 }
 
 interface HeldQuad {
@@ -408,7 +445,8 @@ export class Overlay {
     if (!this.playMode) {
       if (q.grid) drawDots(ctx, occupancyDots(screen, q.grid, q.prob), alpha);
     } else if (this.game && q.orientation) {
-      drawGameMarks(ctx, gameMarks(screen, q.orientation, this.game.pieces, this.game.lastMove), alpha, this.images);
+      const g = this.game;
+      drawGameMarks(ctx, gameMarks(screen, q.orientation, g.pieces, g.lastMove, g.pending ?? null), alpha, this.images, g.pendingProgress ?? 0);
     }
   }
 }

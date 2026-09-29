@@ -9,12 +9,15 @@ import {
   dotAlpha,
   frameToScreen,
   gameMarks,
+  ghostAlpha,
+  GHOST_ALPHA_MAX,
+  GHOST_ALPHA_MIN,
   occupancyDots,
   PIECE_BASE,
   PIECE_SIZE,
   quadAlpha,
 } from '../src/overlay';
-import { formatGame, formatOccupancy } from '../src/debug/panel';
+import { formatGame, formatOccupancy, formatTiming } from '../src/debug/panel';
 import type { PieceCode } from '../src/game/types';
 import { homographyFrom4, applyH, type Point } from '../src/geom/homography';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
@@ -222,12 +225,65 @@ describe('gameMarks', () => {
   });
 
   it('returns nothing for malformed input or a degenerate quad', () => {
-    expect(gameMarks(square, new Uint8Array(10), pieces)).toEqual({ pieces: [], tint: [] });
-    expect(gameMarks(square, identity, pieces.slice(0, 10))).toEqual({ pieces: [], tint: [] });
-    expect(gameMarks([[0, 0], [0, 0], [0, 0], [0, 0]], identity, pieces, { from: 0, to: 1 })).toEqual({ pieces: [], tint: [] });
+    expect(gameMarks(square, new Uint8Array(10), pieces)).toEqual({ pieces: [], tint: [], pendingTint: [] });
+    expect(gameMarks(square, identity, pieces.slice(0, 10))).toEqual({ pieces: [], tint: [], pendingTint: [] });
+    expect(gameMarks([[0, 0], [0, 0], [0, 0], [0, 0]], identity, pieces, { from: 0, to: 1 })).toEqual({ pieces: [], tint: [], pendingTint: [] });
     const bad = identity.slice();
     bad[0] = 200; // out-of-range cell: that square is skipped
     expect(gameMarks(square, bad, pieces).pieces.map((p) => p.sq).sort()).toEqual([4, 60]);
+  });
+});
+
+describe('gameMarks with a pending change', () => {
+  const square: Point[] = [[100, 100], [260, 100], [260, 260], [100, 260]];
+  const identity = Uint8Array.from({ length: 64 }, (_, k) => k);
+  const pieces: Array<PieceCode | null> = new Array(64).fill(null);
+  pieces[12] = 'wP'; // e2
+  pieces[4] = 'wK'; // e1
+  pieces[27] = 'bP'; // d4
+
+  it('dims the moving piece, ghosts it at its destination and tints the cells faintly', () => {
+    const after = pieces.slice();
+    after[28] = 'wP'; // e2-e4
+    after[12] = null;
+    const m = gameMarks(square, identity, pieces, null, { pieces: after, squares: [12, 28] });
+    expect(m.pieces.find((p) => p.sq === 12)).toMatchObject({ code: 'wP', state: 'dim' });
+    expect(m.pieces.find((p) => p.sq === 28)).toMatchObject({ code: 'wP', state: 'ghost' });
+    expect(m.pieces.find((p) => p.sq === 4)!.state).toBeUndefined();
+    expect(m.pendingTint).toHaveLength(2);
+    expect(m.tint).toEqual([]);
+  });
+
+  it('dims a captured piece and draws the ghost above it', () => {
+    const after = pieces.slice();
+    after[27] = 'wP'; // exd4 (sort of)
+    after[12] = null;
+    const m = gameMarks(square, identity, pieces, null, { pieces: after, squares: [12, 27, 27] });
+    expect(m.pieces.filter((p) => p.sq === 27).map((p) => [p.code, p.state])).toEqual([['bP', 'dim'], ['wP', 'ghost']]);
+    expect(m.pendingTint).toHaveLength(2);
+  });
+
+  it('makes ghosts more opaque as the change nears its commit', () => {
+    expect(ghostAlpha(0)).toBe(GHOST_ALPHA_MIN);
+    expect(ghostAlpha(1)).toBe(GHOST_ALPHA_MAX);
+    expect(ghostAlpha(5)).toBe(GHOST_ALPHA_MAX);
+    expect(ghostAlpha(NaN)).toBe(GHOST_ALPHA_MIN);
+  });
+});
+
+describe('formatTiming', () => {
+  it('shows the commit timeline relative to the hand leaving', () => {
+    expect(formatTiming(null)).toBe('commit  -\n');
+    expect(formatTiming({ kind: 'advance', unstableEndAt: 1000, stableAt: 1080.4, favouriteAt: 1150, committedAt: 1420 })).toBe(
+      'commit  advance (from hand off)\n        stable +80 fav +150 commit +420 ms\n',
+    );
+  });
+
+  it('falls back to the favourite time without a preceding unstable frame, and signs early events', () => {
+    expect(formatTiming({ kind: 'revise', unstableEndAt: null, stableAt: null, favouriteAt: 500, committedAt: 1300 })).toBe(
+      'commit  revise (from favourite)\n        fav +0 commit +800 ms\n',
+    );
+    expect(formatTiming({ kind: 'takeback', unstableEndAt: 1000, stableAt: 1040, favouriteAt: 950, committedAt: 1400 })).toContain('fav -50');
   });
 });
 

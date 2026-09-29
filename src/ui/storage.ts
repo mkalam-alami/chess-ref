@@ -3,6 +3,7 @@
 export const GAME_KEY = 'chess-ref.game';
 export const ARCHIVE_KEY = 'chess-ref.archive';
 export const ARCHIVE_MAX = 10;
+export const MUTED_KEY = 'chess-ref.muted';
 
 export interface ArchivedGame {
   /** Time archived (ms since epoch). */
@@ -34,6 +35,23 @@ export function saveGame(saved: string, s: Store | null = store()): void {
     else s?.removeItem(GAME_KEY);
   } catch {
     /* storage unavailable or full */
+  }
+}
+
+/** Whether the sound was muted (default: sound on). */
+export function loadMuted(s: Store | null = store()): boolean {
+  try {
+    return s?.getItem(MUTED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function saveMuted(muted: boolean, s: Store | null = store()): void {
+  try {
+    s?.setItem(MUTED_KEY, muted ? '1' : '0');
+  } catch {
+    /* storage unavailable */
   }
 }
 
