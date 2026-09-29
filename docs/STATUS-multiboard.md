@@ -1,6 +1,6 @@
 # Status: multi-board dataset + occupancy calibration (resume notes)
 
-Companion to [PLAN-multiboard.md](PLAN-multiboard.md). Paused on 2026-09-29 after Wave 3's first prototype (D5), for budget reasons. **No live code under `src/` has changed yet**; everything on `main` so far is test tooling.
+Companion to [PLAN-multiboard.md](PLAN-multiboard.md). Paused on 2026-09-29 after Wave 3's first prototype (D5), for budget reasons. D5 landed in Wave 4 (`5e83163`); it is the only `src/` change so far. The baseline below predates it.
 
 ## What landed on main
 
@@ -11,6 +11,7 @@ Companion to [PLAN-multiboard.md](PLAN-multiboard.md). Paused on 2026-09-29 afte
 | `5f88243` | `tests/fixtures/private/` is gitignored. |
 | `b0bcc2e` | The bench skips images whose `SOURCES.json` split is `"excluded"`. |
 | `1a21e05` | Per-cell classification margin and start-test headroom in the bench. |
+| `5e83163` | **D5 landed:** detection retry with a lower Canny percentile (`retryCannyPercentile`, default 85, 0 disables) in `src/vision/detector.ts`, plus a regression test in `tests/detect.test.ts`. |
 
 ## Dataset (private, not in git)
 
@@ -47,7 +48,7 @@ Raw cell accuracy at 640 px, starting position. The "GT corners" column uses the
 
 ## Wave 3 status
 
-- **D5, detection recall:** done as a prototype. **Not landed.** Diff below.
+- **D5, detection recall:** **landed** in `5e83163` (diff below kept for reference). Realocc bench re-run on the landed commit: orig 5/5 detected (unchanged), `neg-01` no detection, tune 6/8 (01 marble now detected at 0.32% error; 15 and 17 still undetected), tune end-to-end 72.1%. Synth bench not re-run; the prototype's numbers below stand. The every-other-frame retry was not implemented.
 - **D1** (relative/stem features), **D3** (glare/shadow), **D2** (chroma white/black split): not started; cancelled for budget.
 - **D4** (appearance presets): deprioritised by the user.
 
@@ -58,7 +59,7 @@ Raw cell accuracy at 640 px, starting position. The "GT corners" column uses the
 - **17 dock:** almost no edges on the grid lines (glitter, planks, hard shadows), and checker verification is about 0.25 even at the GT corners. Fixing it needs regional edge thresholds and a shadow-robust verification.
 - **Colour-based corner detection** would not have helped any of the three.
 
-### D5 results (prototype)
+### D5 results (prototype; confirmed on the realocc bench after landing)
 
 - **Tune:** 6/8 detected; end-to-end accuracy 61.5% → 72.1%. 01 marble: 0.32% mean corner error, 84.4% cells.
 - **Regressions checked:** original 5 photos unchanged, still no false positive on `neg-01`, `npm test` and `npm run typecheck` pass.
@@ -107,9 +108,9 @@ diff --git a/src/vision/detector.ts b/src/vision/detector.ts
 
 ## Next steps when resuming
 
-1. **Wave 4, land D5:** apply the diff above, run `npm test`, `npm run typecheck`, the synth bench and the realocc bench, then push to `main`. Consider the every-other-frame retry to halve the cost. Add a regression test.
-2. **Wave 3, remaining prototypes:** D1 (symptom 1, black on dark / light squares read as white), D3 (17's shadows), then D2. Each runs in an isolated worktree, reports bench numbers and margins only, and uses a strict time budget. Only the integrator edits `src/vision/occupancy.ts`.
-3. **Calibration:** the start-test score is just under the threshold on orig 05 (0.72) and tune 17 (0.71). Worth a look alongside D1/D3.
+1. **Wave 3, remaining prototypes:** D1 (symptom 1, black on dark / light squares read as white), D3 (17's shadows), then D2. Each runs in an isolated worktree, reports bench numbers and margins only, and uses a strict time budget. Only the integrator edits `src/vision/occupancy.ts`.
+2. **Calibration:** the start-test score is just under the threshold on orig 05 (0.72) and tune 17 (0.71). Worth a look alongside D1/D3.
+3. **Optional:** run the D5 retry only every other frame to halve its cost on frames without a board.
 4. **Final:** score the holdout once, with `REALOCC_HOLDOUT=only`, on the final commit.
 
 ## Process rules (from the user)
