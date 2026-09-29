@@ -117,7 +117,7 @@ async function process(msg: FrameMessage): Promise<void> {
   let orientation: Uint8Array | null = null;
   if (param(msg.params, OCCUPANCY_PARAMS, 'occupancy') > 0) {
     if (det.hb) {
-      const occ = occupancy.update(img, det.hb, msg.params, performance.now());
+      const occ = occupancy.update(img, det.hb, msg.params, performance.now(), msg.visibleRect);
       grid = occ.grid;
       occProb = occ.committedProb;
       occStats = occ.stats;

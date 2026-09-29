@@ -26,6 +26,8 @@ interface ObsOpts {
   /** Per-square class probabilities overriding the grid (vis stays high). */
   probs?: Record<string, [number, number, number]>;
   stable?: boolean;
+  /** Board not wholly in view (vision then also reports stable = false). */
+  framed?: boolean;
   oriented?: boolean;
   calibration?: Observation['calibration'];
 }
@@ -67,7 +69,7 @@ function observation(grid: Uint8Array, t: number, rand: () => number, o: ObsOpts
     const s = p[0]! + p[1]! + p[2]!;
     for (let c = 0; c < 3; c++) logLik[sq * 3 + c] = Math.log(p[c]! / s);
   }
-  return { t, logLik, vis, oriented: o.oriented ?? true, calibration: o.calibration ?? 'calibrated', stable: o.stable ?? true };
+  return { t, logLik, vis, oriented: o.oriented ?? true, calibration: o.calibration ?? 'calibrated', stable: o.stable ?? true, framed: o.framed ?? true };
 }
 
 /** Hand over the board: unstable frames with garbage evidence (or strong evidence for `grid`, to check it is ignored). */
@@ -81,7 +83,7 @@ function handObservation(t: number, rand: () => number, grid?: Uint8Array): Obse
     const s = p[0]! + p[1]! + p[2]!;
     for (let c = 0; c < 3; c++) logLik[sq * 3 + c] = Math.log(p[c]! / s);
   }
-  return { t, logLik, vis, oriented: true, calibration: 'calibrated', stable: false };
+  return { t, logLik, vis, oriented: true, calibration: 'calibrated', stable: false, framed: true };
 }
 
 /** Occupancy after a SAN line from the start. */
@@ -241,6 +243,21 @@ describe('GameTracker moves', () => {
       sim.hand(100);
     }
     expect(sim.show(gridAfter('e4'), 1000).map((e) => e.type)).toEqual(['move']);
+  });
+
+  it('neither locks in nor commits while the board is cropped (framed = false, so stable = false)', () => {
+    // Cropped board: the far edge is out of view (flattened evidence), the rest reads cleanly.
+    const cropped: ObsOpts = { stable: false, framed: false, occluded: ['a8', 'b8', 'c8', 'd8', 'e8', 'f8', 'g8', 'h8'] };
+    const sim = new Sim({}, 4);
+    expect(sim.show(START_GRID, 3000, cropped)).toEqual([]);
+    expect(sim.game.snapshot().state).toBe('waiting');
+    sim.start();
+    // A position one move on, held well past the dwell time on cropped frames: no commit.
+    expect(sim.show(gridAfter('e4'), 3000, cropped)).toEqual([]);
+    expect(sim.sans()).toEqual([]);
+    // Back in view: the move is committed from clean frames.
+    expect(sim.show(gridAfter('e4'), 1000).map((e) => e.type)).toEqual(['move']);
+    expect(sim.sans()).toEqual(['e4']);
   });
 
   it('follows a physical takeback (tentative ply) and reports it as a revision', () => {

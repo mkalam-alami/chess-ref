@@ -15,7 +15,7 @@ import { GameTracker } from './game/game';
 import type { GameEvent, GameSnapshot } from './game/types';
 import { isSimpleQuad } from './geom/cornerOrder';
 import { PointsFilter } from './geom/oneEuro';
-import { Overlay, FADE_MS, HOLD_MS } from './overlay';
+import { Overlay, FADE_MS, HOLD_MS, visibleFrameRect } from './overlay';
 import { MoveList, statusText } from './ui/moves';
 import { pieceImage, preloadPieces } from './ui/pieces';
 import { archivePgn, loadSavedGame, saveGame, unarchiveLast } from './ui/storage';
@@ -139,6 +139,7 @@ function handleResult(r: ResultMessage): void {
   }
   if (r.observation) {
     obsTime = r.observation.t;
+    framed = r.observation.framed;
     handleGameEvents(game.observe(r.observation));
   }
   if (r.corners) {
@@ -173,6 +174,9 @@ let savedGame = '';
 /** Last grid sent to the worker as a position hint ('' = none sent yet). */
 let hintKey = '';
 const gameChip = $('gameChip');
+/** Whether the last observation had the whole board in view; while not, the chip asks to keep it in view. */
+let framed = true;
+const FRAMING_TEXT = 'Keep the whole board in view';
 
 const moves = new MoveList($('moves'), {
   copy: () => void copyPgn(),
@@ -265,8 +269,14 @@ function renderGame(): void {
   app.dataset.game = snapshot.state;
   moves.render(snapshot, obsTime);
   overlay.setGame(snapshot.state === 'waiting' ? null : { pieces: snapshot.pieces, lastMove: snapshot.lastMove });
-  gameChip.textContent = statusText(snapshot);
+  renderChip();
   sendHint();
+}
+
+/** Status chip text: the framing request while the board is not wholly in view, else the game status. */
+function renderChip(): void {
+  const text = framed ? statusText(snapshot) : FRAMING_TEXT;
+  if (gameChip.textContent !== text) gameChip.textContent = text;
 }
 
 {
@@ -356,6 +366,7 @@ async function begin(open: () => Promise<FrameSource>, fullscreen: boolean): Pro
   hintKey = '';
   sendHint();
   moves.root.hidden = false;
+  framed = true;
   modeCounts.full = modeCounts.tracking = 0;
   occStats = undefined;
   occDrops.length = 0;
@@ -440,6 +451,9 @@ async function pump(): Promise<void> {
     height: frame.height,
     params: getParams(),
     debugView: panel.visible ? panel.view : 'none',
+    // What the user sees of the frame (object-fit: cover). The sidebar is not subtracted: the board stays visible
+    // through it.
+    visibleRect: visibleFrameRect(frame.width, frame.height, window.innerWidth, window.innerHeight),
   };
   inFlightId = msg.id;
   worker.postMessage(msg, [frame.bitmap]);
@@ -458,9 +472,11 @@ function loop(now: number): void {
   if (running && source) {
     void pump();
     overlay.setPlayMode(!panel.visible);
-    gameChip.hidden = panel.visible || snapshot.state !== 'waiting';
+    // Play mode only: while waiting for the starting position, or (priority) while the board is not wholly in view.
+    renderChip();
+    gameChip.hidden = panel.visible || (framed && snapshot.state !== 'waiting');
     overlay.draw(now, lastFrameW || source.width, lastFrameH || source.height);
-    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), game: formatGame(snapshot), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
+    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), game: formatGame(snapshot, framed), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
   }
   requestAnimationFrame(loop);
 }

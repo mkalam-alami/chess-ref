@@ -1,15 +1,18 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { mul3 } from '../src/geom/homography';
+import { mul3, type Mat3 } from '../src/geom/homography';
 import { Detector } from '../src/vision/detector';
 import type { CV } from '../src/vision/preprocess';
-import { cameraFromHomography, cellFootprints, OCCUPANCY_PARAMS, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
-import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
+import { boardFramed, cameraFromHomography, cellFootprints, type FrameRect, OCCUPANCY_PARAMS, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
+import { OCC_BLACK, OCC_EMPTY, OCC_WHITE, type Params } from '../src/worker/protocol';
 import { realCases } from './synth/bench';
-import { alignGt, GAME } from './synth/occBench';
+import { alignGt, FRAME_CORNERS_ONLY, GAME } from './synth/occBench';
 import { loadCv } from './synth/cvNode';
 import fs from 'node:fs';
 import path from 'node:path';
 import { H, makeBoardSample, makeCamera, W } from './synth/generate';
+
+/** The rendered boards keep only the board (z = 0) inside the image: see FRAME_CORNERS_ONLY. */
+const P = FRAME_CORNERS_ONLY;
 
 /** Generator camera with the principal point at the image centre; hb in cell units (board 0..8). */
 function cam(azDeg: number, elDeg: number, f: number, D: number) {
@@ -45,6 +48,54 @@ describe('cameraFromHomography', () => {
     expect(Math.hypot(p[0] - q[0], p[1] - q[1])).toBeLessThan(1);
     const top = cameraFromHomography(cam(10, 89.5, 560, 14).hb, W, H)!;
     expect(top.nominal).toBe(true);
+  });
+});
+
+/** Camera turned down by `deg` about its own x axis (K R K^-1): the board moves up the image, the principal point
+ *  stays at the centre. */
+function pitch(deg: number, f: number): Mat3 {
+  const a = (deg * Math.PI) / 180;
+  const K: Mat3 = [f, 0, W / 2, 0, f, H / 2, 0, 0, 1];
+  const Ki: Mat3 = [1 / f, 0, -W / 2 / f, 0, 1 / f, -H / 2 / f, 0, 0, 1];
+  return mul3(K, mul3([1, 0, 0, 0, Math.cos(a), -Math.sin(a), 0, Math.sin(a), Math.cos(a)], Ki));
+}
+
+describe('boardFramed', () => {
+  const full = [0, 0, W, H] as const;
+  const framedFor = (hb: Mat3, rect: FrameRect = full, params: Params = {}) => boardFramed(cameraFromHomography(hb, W, H)!, rect, params);
+
+  it('accepts a board wholly inside the frame, with the margin as a fraction of the short side', () => {
+    const r = framedFor(cam(20, 40, 560, 14).hb);
+    expect(r.framed).toBe(true);
+    expect(r.worst).toBeGreaterThan(0.02 * H);
+    // A margin wider than the room left: refused.
+    expect(framedFor(cam(20, 40, 560, 14).hb, full, { occFrameMargin: (r.worst + 1) / H }).framed).toBe(false);
+  });
+
+  it('refuses a board with a corner outside the frame', () => {
+    const r = framedFor(cam(0, 30, 560, 10).hb);
+    expect(r.framed).toBe(false);
+    expect(r.worst).toBeLessThan(0);
+    expect(framedFor(cam(0, 30, 560, 10).hb, full, { occFrameTopZ: 0, occFrameMargin: 0 }).framed).toBe(false);
+  });
+
+  it('refuses an oblique board whose far-rank piece tops leave through the top edge', () => {
+    // Camera turned down: the board sits at the top of the image, its corners inside with room to spare.
+    const hb = mul3(pitch(12, 560), cam(0, 45, 560, 15).hb);
+    const corners = framedFor(hb, full, { occFrameTopZ: 0 });
+    expect(corners.framed).toBe(true);
+    expect(corners.worst).toBeGreaterThan(0.02 * H);
+    const r = framedFor(hb);
+    expect(r.framed).toBe(false);
+    expect(r.worst).toBeLessThan(0);
+  });
+
+  it('checks against the visible rect, not the whole frame', () => {
+    const { hb } = cam(20, 40, 560, 14);
+    expect(framedFor(hb, full).framed).toBe(true);
+    // A portrait screen showing the middle of a landscape frame (object-fit: cover): the board's sides are cut off.
+    expect(framedFor(hb, [W / 2 - 0.3 * H, 0, W / 2 + 0.3 * H, H]).framed).toBe(false);
+    expect(framedFor(hb, [0, 100, W, H]).framed).toBe(false);
   });
 });
 
@@ -139,8 +190,8 @@ describe('occupancy on synthetic starting positions', () => {
           const gt = alignGt(s.occupancy!, s.corners, r.hb);
           if (!gt) continue;
           const tr = new OccupancyTracker();
-          let out = tr.update(frame, r.hb, {}, 0);
-          for (let t = 1; t < 5; t++) out = tr.update(frame, r.hb, {}, t * 100);
+          let out = tr.update(frame, r.hb, P, 0);
+          for (let t = 1; t < 5; t++) out = tr.update(frame, r.hb, P, t * 100);
           ev.n++;
           if (out.stats.state === 'calibrated') ev.boots++;
           let rawOk = 0;
@@ -191,13 +242,13 @@ describe('occupancy class log-likelihoods', () => {
           if (!r.hb || !s0.corners || !alignGt(s0.occupancy!, s0.corners, r.hb)) continue;
           const tr = new OccupancyTracker();
           const twin = new OccupancyTracker();
-          const lin = { occLikVisGamma: 1 };
-          let out = tr.update(f0, r.hb, {}, 0);
+          const lin = { ...P, occLikVisGamma: 1 };
+          let out = tr.update(f0, r.hb, P, 0);
           let outLin = twin.update(f0, r.hb, lin, 0);
           expect(out.logLik.length).toBe(192);
           let t = 0;
           for (let i = 1; i < 5; i++) {
-            out = tr.update(f0, r.hb, {}, (t += 100));
+            out = tr.update(f0, r.hb, P, (t += 100));
             outLin = twin.update(f0, r.hb, lin, t);
           }
           if (out.stats.state !== 'calibrated') continue;
@@ -206,7 +257,7 @@ describe('occupancy class log-likelihoods', () => {
             const gt = alignGt(s.occupancy!, s.corners!, r.hb)!;
             const fr = { data: s.rgba, width: s.width, height: s.height };
             for (let i = 0; i < 4; i++) {
-              out = tr.update(fr, r.hb, {}, (t += 100));
+              out = tr.update(fr, r.hb, P, (t += 100));
               outLin = twin.update(fr, r.hb, lin, t);
             }
             // committedProb: probability of the committed class, present even when this frame's grid is dropped.

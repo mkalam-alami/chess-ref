@@ -19,6 +19,12 @@ export interface FrameMessage {
   height: number;
   params: Params;
   debugView: DebugView;
+  /**
+   * Part of the frame actually shown on screen, [x0, y0, x1, y1] in frame coordinates (the video is drawn with
+   * `object-fit: cover`, so the screen shows a crop of it). Absent: the whole frame counts as visible. Vision only
+   * counts a frame as evidence when the whole board is inside it (Observation.framed).
+   */
+  visibleRect?: [number, number, number, number];
 }
 
 /** Drops the locked board profile (the "Reset board" button). */
@@ -116,8 +122,12 @@ export interface Observation {
   oriented: boolean;
   /** Occupancy calibration state (OccupancyStats.state); the game only locks in on 'calibrated' (from the start position). */
   calibration: OccupancyStats['state'];
-  /** False on frames that must not count as evidence: dropped, frozen (hand / mass change), or just after a board loss. */
+  /** False on frames that must not count as evidence: dropped, frozen (hand / mass change), just after a board loss,
+   *  not `framed`, or within `occSettleMs` of the board coming back fully into view. */
   stable: boolean;
+  /** Whether the whole board, far-rank piece tops included, is inside the visible part of the frame (see
+   *  FrameMessage.visibleRect). A partly cropped board reads wrong near the edge, so such frames never count. */
+  framed: boolean;
 }
 
 export const OCC_EMPTY = 0;

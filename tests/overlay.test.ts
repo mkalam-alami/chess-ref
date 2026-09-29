@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   coverMap,
+  visibleFrameRect,
   DOT_BLACK,
   DOT_EMPTY,
   DOT_LOW_CONF,
@@ -17,6 +18,24 @@ import { formatGame, formatOccupancy } from '../src/debug/panel';
 import type { PieceCode } from '../src/game/types';
 import { homographyFrom4, applyH, type Point } from '../src/geom/homography';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
+
+describe('visibleFrameRect', () => {
+  it('is the whole frame when the aspect ratios match, and the centred crop otherwise', () => {
+    expect(visibleFrameRect(640, 360, 1280, 720)).toEqual([0, 0, 640, 360]);
+    // Wider viewport: rows cut at the top and bottom.
+    expect(visibleFrameRect(400, 400, 800, 400)).toEqual([0, 100, 400, 300]);
+    // Portrait phone on a landscape frame: only the middle columns are shown.
+    const [x0, y0, x1, y1] = visibleFrameRect(1280, 720, 390, 780);
+    expect(y0).toBe(0);
+    expect(y1).toBe(720);
+    expect(x0).toBeCloseTo(640 - 180);
+    expect(x1).toBeCloseTo(640 + 180);
+    // Inverse of frameToScreen: the rect's corners land on the viewport's corners.
+    const m = coverMap(1280, 720, 390, 780);
+    expect(frameToScreen([x0, y0], m)[0]).toBeCloseTo(0);
+    expect(frameToScreen([x1, y1], m)[0]).toBeCloseTo(390);
+  });
+});
 
 describe('coverMap', () => {
   it('maps identically when aspect ratios match', () => {
@@ -231,5 +250,10 @@ describe('formatGame', () => {
   it('is short while waiting', () => {
     expect(formatGame({ state: 'waiting', turn: 'w', plies: [], top: [] })).toBe('game    waiting\n');
     expect(formatGame(undefined)).toBe('game    -\n');
+  });
+
+  it('flags a board not wholly in view', () => {
+    expect(formatGame({ state: 'waiting', turn: 'w', plies: [], top: [] }, false)).toBe('game    waiting (not framed)\n');
+    expect(formatGame({ state: 'playing', turn: 'w', plies: [], top: [] }, false)).toBe('game    playing w ply 0 (not framed)\n');
   });
 });

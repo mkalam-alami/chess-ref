@@ -19,6 +19,14 @@ export function coverMap(frameW: number, frameH: number, viewW: number, viewH: n
   };
 }
 
+/** The part of the frame shown in the viewport under `object-fit: cover`, [x0, y0, x1, y1] in frame coordinates
+ *  (coverMap inverted on the viewport's corners, clamped to the frame). */
+export function visibleFrameRect(frameW: number, frameH: number, viewW: number, viewH: number): [number, number, number, number] {
+  const m = coverMap(frameW, frameH, viewW, viewH);
+  const cl = (v: number, hi: number) => Math.max(0, Math.min(hi, v));
+  return [cl(-m.offsetX / m.scale, frameW), cl(-m.offsetY / m.scale, frameH), cl((viewW - m.offsetX) / m.scale, frameW), cl((viewH - m.offsetY) / m.scale, frameH)];
+}
+
 /** Frame coordinates -> viewport (CSS pixel) coordinates. */
 export function frameToScreen(p: Point, m: CoverMap): Point {
   return [p[0] * m.scale + m.offsetX, p[1] * m.scale + m.offsetY];

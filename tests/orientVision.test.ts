@@ -13,7 +13,7 @@ import type { CV } from '../src/vision/preprocess';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE, type Params } from '../src/worker/protocol';
 import { loadCv } from './synth/cvNode';
 import { H, makeBoardSample, makeCamera, W, type SampleSpec } from './synth/generate';
-import { alignGt, cellCorrespondence, expectedOrientation, GAME } from './synth/occBench';
+import { alignGt, cellCorrespondence, expectedOrientation, FRAME_CORNERS_ONLY, GAME } from './synth/occBench';
 
 const sq = (s: string) => (s.charCodeAt(1) - 49) * 8 + (s.charCodeAt(0) - 97);
 const parity = (c: number) => ((c & 7) + (c >> 3)) & 1;
@@ -290,6 +290,11 @@ const LIGHT: ReadonlyArray<readonly [number, SampleSpec['elev'], SampleSpec['pal
   [9003, 'overhead', 'wood'], [9019, 'oblique', 'wood'],
 ];
 
+/** The rendered boards keep only the board itself (z = 0) inside the image: tall pieces on the far rank may reach
+ *  the frame edge, which the whole-board-in-view check (boardFramed) rejects. These tests are about orientation on
+ *  boards in view, so they check the corners only (their own framing tests are below). */
+const P: Params = FRAME_CORNERS_ONLY;
+
 interface Board {
   frame: { data: Uint8ClampedArray; width: number; height: number };
   /** Detected homography of the start frame (reused for later positions: fixed camera). */
@@ -327,7 +332,7 @@ describe('orientation on rendered boards', () => {
   }
 
   /** A tracker calibrated on the start frame; returns every result (frames 100 ms apart from t = 0). */
-  function calibrate(b: Board, n = 5, params: Params = {}): { tr: OccupancyTracker; outs: OccupancyResult[]; t: number } {
+  function calibrate(b: Board, n = 5, params: Params = P): { tr: OccupancyTracker; outs: OccupancyResult[]; t: number } {
     const tr = new OccupancyTracker();
     const outs: OccupancyResult[] = [];
     let t = 0;
@@ -375,8 +380,8 @@ describe('orientation on rendered boards', () => {
       const twin = calibrate(b, 8).tr;
       tr.setPosition(MID);
       for (let t = 800; t < 1200; t += 100) {
-        const o = tr.update(b.frame, b.hb, {}, t);
-        const w = twin.update(b.frame, b.hb, {}, t);
+        const o = tr.update(b.frame, b.hb, P, t);
+        const w = twin.update(b.frame, b.hb, P, t);
         expect(o.orientation).toBeNull();
         expect(same(o.grid, w.grid)).toBe(true);
       }
@@ -411,7 +416,7 @@ describe('orientation on rendered boards', () => {
       const o0 = outs[outs.length - 1]!;
       expect(o0.orientation).not.toBeNull();
       const hb2 = mul3(b.hb, BOARD_DIHEDRAL[g]!);
-      const o = tr.update(b.frame, hb2, {}, t + 100);
+      const o = tr.update(b.frame, hb2, P, t + 100);
       expect(same(o.orientation, expectedOrientation(b.corners, hb2, false))).toBe(true);
       // Same physical squares: the committed grid in square order is unchanged.
       expect(same(toSquareOrder(o.grid!, o.orientation!), toSquareOrder(o0.grid!, o0.orientation!))).toBe(true);
@@ -444,7 +449,7 @@ describe('orientation on rendered boards', () => {
         const want = expectedOrientation(b.corners, hb2, false)!;
         let found = -1;
         for (let i = 1; i <= 8; i++) {
-          const o = tr.update(b.frame, hb2, {}, (t += 100));
+          const o = tr.update(b.frame, hb2, P, (t += 100));
           if (i === 1) {
             expect(o.orientation).toBeNull();
             expect(o.observation.oriented).toBe(false);
@@ -480,7 +485,7 @@ describe('orientation on rendered boards', () => {
       return learn.apply(this, a);
     };
     for (let i = 0; i < 4; i++) {
-      const o = tr.update(b.frame, b.hb, {}, (t += 100));
+      const o = tr.update(b.frame, b.hb, P, (t += 100));
       // Hysteresis bypassed from the first frame: the hint in board cells.
       expect(same(o.grid, toCellOrder(hint, orient))).toBe(true);
       expect(same(o.orientation, orient)).toBe(true);
@@ -491,14 +496,14 @@ describe('orientation on rendered boards', () => {
     internals.learn = learn;
     // A hint for a position the board now shows (after 1. e4) keeps the grid in place too.
     const e4 = board(DARK[2]![0], DARK[2]![1], DARK[2]![2], 1);
-    for (let i = 0; i < 3; i++) expect(same(tr.update(e4.frame, e4.hb, {}, (t += 100)).grid, toCellOrder(hint, orient))).toBe(true);
+    for (let i = 0; i < 3; i++) expect(same(tr.update(e4.frame, e4.hb, P, (t += 100)).grid, toCellOrder(hint, orient))).toBe(true);
     // No game: back to the per-cell filter, whose hysteresis starts from the hint's grid.
     tr.setPosition(null);
     const e2 = orient[sq('e2')]!;
     const e4c = orient[sq('e4')]!;
     const hold = 3; // occHoldFrames default
     for (let i = 1; i <= hold + 2; i++) {
-      const o = tr.update(b.frame, b.hb, {}, (t += 100));
+      const o = tr.update(b.frame, b.hb, P, (t += 100));
       if (i < hold) {
         expect(o.grid![e2]).toBe(OCC_EMPTY);
         expect(o.grid![e4c]).toBe(OCC_WHITE);
@@ -518,29 +523,29 @@ describe('orientation on rendered boards', () => {
     let t = t0;
     // Follow the game with the hint so the models see the mid-game board.
     tr.setPosition(MID);
-    for (let i = 0; i < 3; i++) tr.update(mid.frame, mid.hb, {}, (t += 100));
+    for (let i = 0; i < 3; i++) tr.update(mid.frame, mid.hb, P, (t += 100));
     for (let g = 0; g < 8; g++) {
       tr.noBoard((t += 100));
       t += 1500; // > occLossMs
       const hb2 = mul3(b.hb, BOARD_DIHEDRAL[g]!);
       const want = expectedOrientation(b.corners, hb2, false)!;
-      const o1 = tr.update(mid.frame, hb2, {}, t);
+      const o1 = tr.update(mid.frame, hb2, P, t);
       // Unverified after the loss; the first agreeing frame is not enough (occOrientFrames = 2).
       expect(o1.orientation).toBeNull();
       expect(o1.observation.oriented).toBe(false);
       expect(o1.stats.state).toBe('calibrated');
-      const o2 = tr.update(mid.frame, hb2, {}, (t += 100));
+      const o2 = tr.update(mid.frame, hb2, P, (t += 100));
       expect(same(o2.orientation, want)).toBe(true);
       // From the next frame on the hint owns the grid again (on the orienting frame itself the grid is still the
       // filter's own, which ran before the orientation was adopted).
-      const o3 = tr.update(mid.frame, hb2, {}, (t += 100));
+      const o3 = tr.update(mid.frame, hb2, P, (t += 100));
       expect(same(o3.orientation, want)).toBe(true);
       expect(same(o3.grid, toCellOrder(MID, want))).toBe(true);
     }
     // More agreeing frames required: still unoriented after two.
     tr.noBoard((t += 100));
     t += 1500;
-    const p3: Params = { occOrientFrames: 3 };
+    const p3: Params = { ...P, occOrientFrames: 3 };
     expect(tr.update(mid.frame, b.hb, p3, t).orientation).toBeNull();
     expect(tr.update(mid.frame, b.hb, p3, (t += 100)).orientation).toBeNull();
     expect(same(tr.update(mid.frame, b.hb, p3, (t += 100)).orientation, expectedOrientation(b.corners, b.hb, false))).toBe(true);
@@ -555,21 +560,113 @@ describe('orientation on rendered boards', () => {
     t += 1500;
     // An empty board: fully symmetric, but it contradicts every visible piece.
     tr.setPosition(new Uint8Array(64));
-    for (let i = 0; i < 5; i++) expect(tr.update(mid.frame, b.hb, {}, (t += 100)).orientation).toBeNull();
+    for (let i = 0; i < 5; i++) expect(tr.update(mid.frame, b.hb, P, (t += 100)).orientation).toBeNull();
     expect(tr.orientReason).toBe('miss');
     // A demanding margin refuses even the right hint.
     tr.setPosition(MID);
-    const strict: Params = { occOrientMargin: 1e6 };
+    const strict: Params = { ...P, occOrientMargin: 1e6 };
     for (let i = 0; i < 3; i++) expect(tr.update(mid.frame, b.hb, strict, (t += 100)).orientation).toBeNull();
     expect(tr.orientReason).toBe('margin');
     // With the default margin it is found.
-    tr.update(mid.frame, b.hb, {}, (t += 100));
-    expect(same(tr.update(mid.frame, b.hb, {}, (t += 100)).orientation, expectedOrientation(b.corners, b.hb, false))).toBe(true);
+    tr.update(mid.frame, b.hb, P, (t += 100));
+    expect(same(tr.update(mid.frame, b.hb, P, (t += 100)).orientation, expectedOrientation(b.corners, b.hb, false))).toBe(true);
+  });
+
+  it('does not count frames with the board partly out of view: no calibration, learning or orientation; settles after', () => {
+    // Default framing rule (not P): this overhead board is wholly in view, far-rank piece tops included.
+    const b = board(...DARK[0]!);
+    /** The same scene moved dx px to the right (image and homography). */
+    const shifted = (dx: number) => {
+      const data = new Uint8ClampedArray(b.frame.data.length);
+      for (let y = 0; y < H; y++) data.set(b.frame.data.subarray(y * W * 4, (y * W + W - dx) * 4), (y * W + dx) * 4);
+      return { frame: { data, width: W, height: H }, hb: mul3([1, 0, dx, 0, 1, 0, 0, 0, 1], b.hb) };
+    };
+    const out = shifted(150);
+    expect(Math.max(...genCorners(out.hb).map((p) => p[0]))).toBeGreaterThan(W);
+    const internal = ['learn', 'tryBootstrap', 'calibrate', 'tryOrient', 'recheckParity'];
+    const spy = (tr: OccupancyTracker) => {
+      const calls: Record<string, number> = {};
+      const internals = tr as unknown as Record<string, (...a: unknown[]) => unknown>;
+      for (const k of internal) {
+        const f = internals[k]!;
+        calls[k] = 0;
+        internals[k] = function (this: unknown, ...a: unknown[]) {
+          calls[k]!++;
+          return f.apply(this, a);
+        };
+      }
+      return calls;
+    };
+    const models = (tr: OccupancyTracker) =>
+      JSON.stringify((tr as unknown as { models: unknown }).models, (_, v) => (v instanceof Float64Array ? Array.from(v) : v));
+    /** One frame; on a frame not in view, checks that it counted for nothing. */
+    const step = (tr: OccupancyTracker, calls: Record<string, number>, sc: { frame: Board['frame']; hb: Mat3 }, t: number, rect?: [number, number, number, number]) => {
+      const m0 = models(tr);
+      const c0 = { ...calls };
+      const o = tr.update(sc.frame, sc.hb, {}, t, rect);
+      if (!o.observation.framed) {
+        expect(o.observation.stable).toBe(false);
+        expect(o.grid).toBeNull();
+        expect(calls).toEqual(c0);
+        expect(models(tr)).toBe(m0);
+      }
+      return o;
+    };
+
+    // Not calibrated yet: cropped frames never calibrate, not even unsupervised past occFallbackMs.
+    const tr0 = new OccupancyTracker();
+    const calls0 = spy(tr0);
+    for (let t = 0; t <= 9000; t += 250) expect(step(tr0, calls0, out, t).observation.framed).toBe(false);
+    expect(tr0.calibrated).toBe(false);
+
+    // Calibrated and oriented, then the board slides out to the right (25 px per frame, a moving camera) and back.
+    const { tr, t: t0 } = calibrate(b, 5, {});
+    const orient = tr.orientation!;
+    expect(orient).not.toBeNull();
+    const calls = spy(tr);
+    let t = t0;
+    let o = step(tr, calls, b, (t += 100));
+    expect(o.observation.framed).toBe(true);
+    expect(o.observation.stable).toBe(true);
+    expect(calls.learn).toBe(1);
+    const g0 = o.grid;
+    let lastCrop = -Infinity;
+    const path = [25, 50, 75, 100, 125, 150, 150, 150, 150, 125, 100, 75, 50, 25, 0];
+    for (const dx of path) {
+      o = step(tr, calls, shifted(dx), (t += 100));
+      // Frozen for occSettleMs after the last frame not in view.
+      if (!o.observation.framed) lastCrop = t;
+      else expect(o.observation.stable).toBe(t - lastCrop >= 400);
+      // The orientation is kept throughout.
+      expect(same(o.orientation, orient)).toBe(true);
+    }
+    expect(lastCrop).toBeGreaterThan(t0);
+    // The visible rect counts, not the frame: the unshifted frame with its left part off screen.
+    const left = Math.min(...genCorners(b.hb).map((p) => p[0]));
+    o = step(tr, calls, b, (t += 100), [left + 20, 0, W, H]);
+    expect(o.observation.framed).toBe(false);
+    expect(o.stats.frozen).toBe(true);
+    lastCrop = t;
+    for (let i = 0; i < 6; i++) {
+      o = step(tr, calls, b, (t += 100), [0, 0, W, H]);
+      expect(o.observation.framed).toBe(true);
+      expect(o.observation.stable).toBe(t - lastCrop >= 400);
+    }
+    expect(o.observation.stable).toBe(true);
+    // Nothing was committed from the cropped frames.
+    expect(same(o.grid, g0)).toBe(true);
+
+    // After a long loss the orientation is re-verified: never on frames not in view, then again once back in view.
+    tr.noBoard((t += 100));
+    t += 1500;
+    for (let i = 0; i < 4; i++) expect(step(tr, calls, out, (t += 100)).orientation).toBeNull();
+    for (const dx of [125, 100, 75, 50, 25, 0, 0, 0, 0, 0, 0, 0, 0]) if (step(tr, calls, shifted(dx), (t += 100)).orientation) break;
+    expect(same(tr.orientation, orient)).toBe(true);
   });
 
   it('keeps the models and orientation across noBoard; stable is false while settling; only reset() drops them', () => {
     const b = board(...DARK[0]!);
-    const fresh = new OccupancyTracker().update(b.frame, b.hb, {}, 0);
+    const fresh = new OccupancyTracker().update(b.frame, b.hb, P, 0);
     // Before calibration: not stable, not oriented.
     expect(fresh.observation.stable).toBe(false);
     expect(fresh.observation.calibration).toBe('start');
@@ -579,30 +676,30 @@ describe('orientation on rendered boards', () => {
     // Short loss (< occLossMs): orientation kept; frozen for occSettleMs after the board-less frame.
     tr.noBoard((t += 100));
     const lostAt = t;
-    let o = tr.update(b.frame, b.hb, {}, (t += 100));
+    let o = tr.update(b.frame, b.hb, P, (t += 100));
     expect(same(o.orientation, orient)).toBe(true);
     expect(o.observation.oriented).toBe(true);
     expect(o.observation.calibration).toBe('calibrated');
     expect(o.observation.stable).toBe(false);
     expect(o.stats.frozen).toBe(true);
-    o = tr.update(b.frame, b.hb, {}, lostAt + 350);
+    o = tr.update(b.frame, b.hb, P, lostAt + 350);
     expect(o.observation.stable).toBe(false);
-    o = tr.update(b.frame, b.hb, {}, (t = lostAt + 450));
+    o = tr.update(b.frame, b.hb, P, (t = lostAt + 450));
     expect(o.observation.stable).toBe(true);
     // Long loss: the models survive, the orientation is re-verified (not dropped) and comes back.
     tr.noBoard((t += 100));
     t += 2000;
-    o = tr.update(b.frame, b.hb, {}, t);
+    o = tr.update(b.frame, b.hb, P, t);
     expect(tr.calibrated).toBe(true);
     expect(o.stats.state).toBe('calibrated');
     expect(o.orientation).toBeNull();
-    o = tr.update(b.frame, b.hb, {}, (t += 100));
+    o = tr.update(b.frame, b.hb, P, (t += 100));
     expect(same(o.orientation, orient)).toBe(true);
     // reset(): models and orientation gone; the next frame is uncalibrated and unstable.
     tr.reset();
     expect(tr.calibrated).toBe(false);
     expect(tr.orientation).toBeNull();
-    o = tr.update(b.frame, b.hb, {}, (t += 100));
+    o = tr.update(b.frame, b.hb, P, (t += 100));
     expect(o.observation.calibration).toBe('start');
     expect(o.observation.stable).toBe(false);
     expect(o.orientation).toBeNull();

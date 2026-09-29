@@ -58,6 +58,11 @@ export const OCCUPANCY_PARAMS: readonly ParamSpec[] = [
   /** Dark-a1 check: least lightness difference (L*) between the two parities' empty models for the check to count;
    *  below it the parity is inconclusive and the handedness alone decides. */
   { name: 'occParityMinDL', min: 0, max: 30, step: 1, default: 4 },
+  /** Framing: height (cells) above the board corners that must be in view too, so the tops of tall pieces on the far
+   *  rank count (a cropped board reads wrong near the edge; see boardFramed). */
+  { name: 'occFrameTopZ', min: 0, max: 3, step: 0.1, default: 1.2 },
+  /** Framing: the visible rect is shrunk by this fraction of the frame's short side before the check. */
+  { name: 'occFrameMargin', min: 0, max: 0.1, step: 0.005, default: 0.02 },
 ];
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -147,6 +152,29 @@ export function cameraFromHomography(hb: Mat3, width: number, height: number, fo
     return [(f * X) / Z + cx, (f * Y) / Z + cy];
   };
   return { f, cx, cy, nominal, centre, project };
+}
+
+/** A rect of the frame, [x0, y0, x1, y1] in pixels (FrameMessage.visibleRect). */
+export type FrameRect = readonly [number, number, number, number];
+
+/**
+ * Whether the whole board is in view: its 4 corners at z = 0 and again at z = `occFrameTopZ` (the tops of tall
+ * pieces on the corner squares, so the far rank's pieces count too) must all lie inside `rect` shrunk by
+ * `occFrameMargin` of the frame's short side (the frame is 2 cx x 2 cy). A point behind the camera is outside.
+ * `worst` is the smallest distance (px) of the 8 points inside the unshrunk rect: negative when one is outside,
+ * -Infinity when one is behind the camera.
+ */
+export function boardFramed(cam: BoardCamera, rect: FrameRect, params: Params = {}): { framed: boolean; worst: number } {
+  const zTop = param(params, OCCUPANCY_PARAMS, 'occFrameTopZ');
+  const margin = param(params, OCCUPANCY_PARAMS, 'occFrameMargin') * 2 * Math.min(cam.cx, cam.cy);
+  let worst = Infinity;
+  for (const z of [0, zTop])
+    for (const [x, y] of [[0, 0], [8, 0], [8, 8], [0, 8]] as const) {
+      const p = cam.project(x, y, z);
+      worst = p ? Math.min(worst, p[0] - rect[0], rect[2] - p[0], p[1] - rect[1], rect[3] - p[1]) : -Infinity;
+      if (worst === -Infinity) return { framed: false, worst };
+    }
+  return { framed: worst >= margin, worst };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -786,8 +814,9 @@ export interface OccupancyResult {
   stats: OccupancyStats;
   /**
    * The frame's evidence for the game layer: logLik and the visible fractions in chess square order when oriented
-   * (board cell order otherwise), the calibration state, and `stable` = calibrated, not dropped and not frozen (a
-   * freeze covers mass changes such as a hand, and the `occSettleMs` after any frame without a board).
+   * (board cell order otherwise), the calibration state, `framed` (see boardFramed) and `stable` = framed, calibrated,
+   * not dropped and not frozen (a freeze covers mass changes such as a hand, and the `occSettleMs` after any frame
+   * without a board or with the board not fully in view).
    */
   observation: Observation;
   /** orientation[sq] = board cell of chess square sq (a1 = 0 ... h8 = 63); null while not oriented. */
@@ -1045,7 +1074,13 @@ export class OccupancyTracker {
     return this.lastStats;
   }
 
-  update(frame: RawFrame, hb: Mat3, params: Params, nowMs: number): OccupancyResult {
+  /**
+   * One frame with a board. `visibleRect` (default: the whole frame) is the part of the frame the user sees; when the
+   * board is not wholly inside it (boardFramed) the frame is treated like a hand over the board: the filter freezes
+   * (commits resume `occSettleMs` after the board is fully back), nothing is calibrated, learnt or oriented, and the
+   * result is `stable` = `framed` = false with no grid. Occupancy is still computed (debug view, committedProb).
+   */
+  update(frame: RawFrame, hb: Mat3, params: Params, nowMs: number, visibleRect?: FrameRect): OccupancyResult {
     const raw = new Uint8Array(64);
     const conf = new Float32Array(64);
     const logLik = new Float32Array(64 * 3).fill(-Math.log(3));
@@ -1065,17 +1100,23 @@ export class OccupancyTracker {
     }
     this.lastHb = hb;
     const cam = cameraFromHomography(hb, frame.width, frame.height, param(params, OCCUPANCY_PARAMS, 'occFovDeg'));
+    // Without a camera the framing is unknown (the frame is unstable anyway): not reported as cropped.
+    const framed = !cam || boardFramed(cam, visibleRect ?? [0, 0, frame.width, frame.height], params).framed;
     const fail = (): OccupancyResult => {
       this.lastStats = this.stats(0, true, false);
-      return this.result(nowMs, null, raw, conf, logLik, new Float32Array(64), null, false);
+      return this.result(nowMs, null, raw, conf, logLik, new Float32Array(64), null, false, framed);
     };
     if (!cam) return fail();
+    if (!framed) {
+      this.filter.noBoard(nowMs);
+      this.bootCount = 0;
+    }
     const fp = cellFootprints(cam, frame.width, frame.height, params);
     const s = sampleFrame(frame, fp);
     const dev = param(params, OCCUPANCY_PARAMS, 'occDeviation');
 
-    if (this.state !== 'calibrated') this.tryBootstrap(fp, s, params, dev);
-    if (!this.models && nowMs - this.firstSeenAt > param(params, OCCUPANCY_PARAMS, 'occFallbackMs')) {
+    if (framed && this.state !== 'calibrated') this.tryBootstrap(fp, s, params, dev);
+    if (framed && !this.models && nowMs - this.firstSeenAt > param(params, OCCUPANCY_PARAMS, 'occFallbackMs')) {
       const u = fitUnsupervised(cellFeatures(fp, s, new Float32Array(64).fill(0.3)), dev);
       if (u && this.calibrate(fp, s, u.grid, dev)) this.state = 'fallback';
     }
@@ -1095,7 +1136,7 @@ export class OccupancyTracker {
     const prior = stale ? STALE_PRIOR : priorOf(committed);
     const featsNow = () => cellFeatures(fp, s, prior, stale ? undefined : illumGains(cellFeatures(fp, s, prior), committed, this.refl));
     let feats = featsNow();
-    if (this.parityUnchecked) {
+    if (framed && this.parityUnchecked) {
       const r = this.recheckParity(feats);
       if (r !== 'inconclusive') this.parityUnchecked = false;
       if (r === 'swapped') feats = featsNow();
@@ -1142,23 +1183,24 @@ export class OccupancyTracker {
     for (let c = 0; c < 64; c++) if (conf[c]! < cellMin) low++;
     const dropped = low > param(params, OCCUPANCY_PARAMS, 'occMaxLowCells') || sum / 64 < param(params, OCCUPANCY_PARAMS, 'occFrameMin');
     let frozen = this.filter.frozen(nowMs, params);
-    if (!dropped) {
+    if (!dropped && framed) {
       frozen = this.filter.update(raw, conf, params, nowMs, !hintCells);
       if (!stale) this.learn(feats, raw, conf, this.filter.committed!, params);
     }
-    const stable = !dropped && !frozen;
+    const stable = framed && !dropped && !frozen;
     if (!this.orientOk && stable) this.tryOrient(logLik, hb, params);
     this.debug = { fp, weights: this.weights(fp, prior), raw, conf, feats };
     this.lastStats = this.stats(low, dropped, frozen);
     const committedNow = this.filter.committed ?? committed;
     const committedProb = new Float32Array(64);
     for (let c = 0; c < 64; c++) committedProb[c] = Math.exp(logLik[c * 3 + committedNow[c]!]!);
-    return this.result(nowMs, dropped ? null : new Uint8Array(committedNow), raw, conf, logLik, feats.vis, committedProb, stable);
+    const grid = dropped || !framed ? null : new Uint8Array(committedNow);
+    return this.result(nowMs, grid, raw, conf, logLik, feats.vis, committedProb, stable, framed);
   }
 
   private result(
     t: number, grid: Uint8Array | null, raw: Uint8Array, conf: Float32Array, logLik: Float32Array, vis: Float32Array,
-    committedProb: Float32Array | null, stable: boolean,
+    committedProb: Float32Array | null, stable: boolean, framed: boolean,
   ): OccupancyResult {
     const orientation = this.orientation;
     const observation: Observation = {
@@ -1168,6 +1210,7 @@ export class OccupancyTracker {
       oriented: orientation !== null,
       calibration: this.lastStats.state,
       stable,
+      framed,
     };
     return { grid, raw, conf, logLik, committedProb, stats: this.lastStats, observation, orientation };
   }

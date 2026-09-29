@@ -4,6 +4,7 @@ import type { Detector } from '../../src/vision/detector';
 import { BOARD_DIHEDRAL } from '../../src/geom/cornerOrder';
 import { boardHandedness, chooseOrientation, OccupancyTracker, ORIENT_MAPS, START_SQUARES, toCellOrder } from '../../src/vision/occupancy';
 import type { CV } from '../../src/vision/preprocess';
+import type { Params } from '../../src/worker/protocol';
 import { makeBoardSample } from './generate';
 
 /** Generator cell of each of hb's cells (hb cell c covers generator cell out[c]); null if hb is not a relabelling of
@@ -50,6 +51,11 @@ export const GAME: ReadonlyArray<readonly [number, number]> = [
   ['e2', 'e4'], ['e7', 'e5'], ['g1', 'f3'], ['b8', 'c6'], ['f1', 'b5'], ['a7', 'a6'], ['b5', 'c6'],
 ].map(([a, b]) => [sq(a!), sq(b!)] as const);
 
+/** Tracker params that reduce the whole-board-in-view check (boardFramed) to the board corners at z = 0 with no margin:
+ *  the generator only keeps the board itself inside the image, so tall pieces on the far rank may reach past the
+ *  frame edge. For tests about something else on such boards. */
+export const FRAME_CORNERS_ONLY: Params = { occFrameTopZ: 0, occFrameMargin: 0 };
+
 const FRAMES_PER_POS = 5;
 
 const same = (a: ArrayLike<number>, b: ArrayLike<number>) => a.length === b.length && Array.from(a).every((v, i) => v === b[i]);
@@ -58,6 +64,8 @@ export function occupancyBench(cv: CV, det: Detector, n: number, seed: number): 
   const lines: string[] = [];
   for (const elev of ['overhead', 'oblique'] as const)
     for (const palette of ['wood', 'vinyl', 'printed'] as const) {
+      // Boards not wholly in view by boardFramed's default rule (never calibrated on, see FRAME_CORNERS_ONLY).
+      let unframed = 0;
       let tried = 0, used = 0, boots = 0, startCells = 0, startOk = 0, startDrop = 0;
       let seqFrames = 0, seqDrop = 0, seqCells = 0, seqOk = 0, finalOk = 0, finalN = 0;
       // Orientation after the start frames: right / refused on a light-a1 board (expected) / missed / WRONG.
@@ -79,6 +87,7 @@ export function occupancyBench(cv: CV, det: Detector, n: number, seed: number): 
         const tr = new OccupancyTracker();
         let t = 0;
         let out = tr.update(f0, hb, {}, t);
+        if (!out.observation.framed) unframed++;
         for (let i = 1; i < FRAMES_PER_POS; i++) out = tr.update(f0, hb, {}, (t += 100));
         if (out.stats.state === 'calibrated') boots++;
         if (!out.grid) startDrop++;
@@ -153,7 +162,7 @@ export function occupancyBench(cv: CV, det: Detector, n: number, seed: number): 
       }
       const pct = (a: number, b: number) => (b ? ((a / b) * 100).toFixed(1) + '%' : '-');
       lines.push(
-        `${`${elev}-${palette}`.padEnd(18)} det ${used}/${tried} calib ${boots}/${used} start grid ${pct(startOk, startCells)} drop ${startDrop}` +
+        `${`${elev}-${palette}`.padEnd(18)} det ${used}/${tried} unframed ${unframed} calib ${boots}/${used} start grid ${pct(startOk, startCells)} drop ${startDrop}` +
           ` | game: cells ${pct(seqOk, seqCells)} frame drops ${pct(seqDrop, seqFrames)} final exact ${finalOk}/${finalN}` +
           ` | orient: ok ${orOk}/${boots - orFlip} refused(light a1) ${orRefused}/${orFlip} missed ${orMissed} WRONG ${orWrong}` +
           ` | re-orient: ok ${reOk}/${reN}${reOk ? ` (${(reFrames / reOk).toFixed(1)} fr)` : ''} WRONG ${reWrong} | min gap ${minGap.toFixed(0)}`,

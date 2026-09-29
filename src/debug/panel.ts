@@ -63,10 +63,11 @@ export interface DebugStats {
   game?: string;
 }
 
-/** Game summary for the stats block: state, side to move and ply count, then the top-3 hypotheses with scores. */
-export function formatGame(s: Pick<GameSnapshot, 'state' | 'turn' | 'plies' | 'top'> | undefined): string {
+/** Game summary for the stats block: state, side to move and ply count, ' (not framed)' while the last observation's
+ *  board was not wholly in view (`framed` false), then the top-3 hypotheses with scores. */
+export function formatGame(s: Pick<GameSnapshot, 'state' | 'turn' | 'plies' | 'top'> | undefined, framed = true): string {
   if (!s) return 'game    -\n';
-  let out = `game    ${s.state}${s.state === 'waiting' ? '' : ` ${s.turn} ply ${s.plies.length}`}\n`;
+  let out = `game    ${s.state}${s.state === 'waiting' ? '' : ` ${s.turn} ply ${s.plies.length}`}${framed ? '' : ' (not framed)'}\n`;
   s.top.slice(0, 3).forEach((h, k) => {
     out += `${k === 0 ? '  top ' : '      '}${(h.line || '(anchor)').padEnd(12)}${Number.isFinite(h.score) ? h.score.toFixed(1) : String(h.score)}\n`;
   });
