@@ -5,7 +5,7 @@ import type { CV } from '../src/vision/preprocess';
 import { cameraFromHomography, cellFootprints, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
 import { realCases } from './synth/bench';
-import { alignGt } from './synth/occBench';
+import { alignGt, GAME } from './synth/occBench';
 import { loadCv } from './synth/cvNode';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -159,6 +159,55 @@ describe('occupancy on synthetic starting positions', () => {
     expect(ev.boots / ev.n).toBeGreaterThanOrEqual(0.75);
     expect(ev.rawAcc / ev.n).toBeGreaterThanOrEqual(0.85);
   }, 120_000);
+});
+
+describe('occupancy class log-likelihoods', () => {
+  let cv: CV;
+  let det: Detector;
+  beforeAll(async () => {
+    ({ cv } = await loadCv());
+    det = new Detector(cv);
+  }, 60_000);
+
+  it('ranks the true class first in most cells and is roughly calibrated', () => {
+    let n = 0;
+    let top = 0;
+    let pSum = 0;
+    let seed = 7100;
+    for (const elev of ['overhead', 'oblique'] as const)
+      for (const palette of ['wood', 'vinyl', 'printed'] as const)
+        for (let k = 0; k < 2; k++) {
+          const sd = seed++;
+          const s0 = makeBoardSample(cv, sd, { elev, palette, pieces: 'start' });
+          const f0 = { data: s0.rgba, width: s0.width, height: s0.height };
+          const r = det.detect(f0 as unknown as ImageData, {});
+          if (!r.hb || !s0.corners || !alignGt(s0.occupancy!, s0.corners, r.hb)) continue;
+          const tr = new OccupancyTracker();
+          let out = tr.update(f0, r.hb, {}, 0);
+          expect(out.logLik.length).toBe(192);
+          let t = 0;
+          for (let i = 1; i < 5; i++) out = tr.update(f0, r.hb, {}, (t += 100));
+          if (out.stats.state !== 'calibrated') continue;
+          for (let m = 0; m <= 3; m++) {
+            const s = makeBoardSample(cv, sd, { elev, palette, pieces: 'start' }, GAME.slice(0, m));
+            const gt = alignGt(s.occupancy!, s.corners!, r.hb)!;
+            for (let i = 0; i < 4; i++) out = tr.update({ data: s.rgba, width: s.width, height: s.height }, r.hb, {}, (t += 100));
+            for (let c = 0; c < 64; c++) {
+              const l = out.logLik.subarray(c * 3, c * 3 + 3);
+              expect(Math.abs(Math.exp(l[0]!) + Math.exp(l[1]!) + Math.exp(l[2]!) - 1)).toBeLessThan(1e-4);
+              let arg = 0;
+              for (let q = 1; q < 3; q++) if (l[q]! > l[arg]!) arg = q;
+              n++;
+              pSum += Math.exp(l[arg]!);
+              if (arg === gt[c]) top++;
+            }
+          }
+        }
+    console.log(`logLik: n=${n} top-1 ${((top / n) * 100).toFixed(1)}% mean predicted ${((pSum / n) * 100).toFixed(1)}%`);
+    expect(n).toBeGreaterThanOrEqual(64 * 4 * 6);
+    expect(top / n).toBeGreaterThanOrEqual(0.9);
+    expect(Math.abs(pSum / n - top / n)).toBeLessThan(0.1);
+  }, 180_000);
 });
 
 describe('occupancy on real starting-position photos', () => {

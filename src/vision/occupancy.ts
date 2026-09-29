@@ -36,6 +36,9 @@ export const OCCUPANCY_PARAMS: readonly ParamSpec[] = [
   { name: 'occBootFrames', min: 1, max: 10, step: 1, default: 2 },
   /** Without a starting position for this long, calibrate unsupervised. */
   { name: 'occFallbackMs', min: 1000, max: 30000, step: 500, default: 8000 },
+  /** Temperature of the per-cell class log-likelihoods (the five features are correlated, so their summed NLL is
+   *  over-confident by about this factor). */
+  { name: 'occLikTemp', min: 1, max: 10, step: 0.25, default: 3 },
   /** EMA rate of the model updates from confident cells. */
   { name: 'occLearnRate', min: 0, max: 0.2, step: 0.005, default: 0.02 },
 ];
@@ -270,11 +273,12 @@ export interface RawFrame {
   height: number;
 }
 
-/** Per-sample colour (Lab) and local luminance gradient from the raw RGBA frame. */
+/** Per-sample linear RGB (5-tap mean) and local luminance gradient from the raw RGBA frame. Lab is computed per cell
+ *  in `cellFeatures`, after the illumination gain of the cell is applied. */
 export interface Samples {
-  L: Float32Array;
-  a: Float32Array;
-  b: Float32Array;
+  r: Float32Array;
+  gr: Float32Array;
+  bl: Float32Array;
   g: Float32Array;
 }
 
@@ -287,7 +291,7 @@ const labF = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116)
 
 export function sampleFrame(frame: RawFrame, fp: Footprints, out?: Samples): Samples {
   const N = fp.w0.length;
-  const s = out ?? { L: new Float32Array(N), a: new Float32Array(N), b: new Float32Array(N), g: new Float32Array(N) };
+  const s = out ?? { r: new Float32Array(N), gr: new Float32Array(N), bl: new Float32Array(N), g: new Float32Array(N) };
   const { data, width: w, height: h } = frame;
   const off = [0, 0, -1, 0, 1, 0, 0, -1, 0, 1];
   const lum = new Float32Array(5);
@@ -311,15 +315,9 @@ export function sampleFrame(frame: RawFrame, fp: Footprints, out?: Samples): Sam
       bl += SRGB_LIN[B]!;
       lum[q] = 0.299 * R + 0.587 * G + 0.114 * B;
     }
-    r /= 5;
-    gr /= 5;
-    bl /= 5;
-    const X = labF((0.4124 * r + 0.3576 * gr + 0.1805 * bl) / 0.9505);
-    const Y = labF(0.2126 * r + 0.7152 * gr + 0.0722 * bl);
-    const Z = labF((0.0193 * r + 0.1192 * gr + 0.9505 * bl) / 1.089);
-    s.L[k] = 116 * Y - 16;
-    s.a[k] = 500 * (X - Y);
-    s.b[k] = 200 * (Y - Z);
+    s.r[k] = r / 5;
+    s.gr[k] = gr / 5;
+    s.bl[k] = bl / 5;
     s.g[k] = ((Math.abs(lum[2]! - lum[1]!) + Math.abs(lum[4]! - lum[3]!)) * 100) / 255;
   }
   return s;
@@ -332,18 +330,25 @@ export interface CellFeatures {
   x: Float32Array;
   /** Visible fraction of each cell's footprint under the occupancy prior. */
   vis: Float32Array;
+  /** Log of the weighted mean linear luminance of each cell (before its gain), for the illumination field. */
+  logY: Float32Array;
 }
 
 const MIN_OCC_WEIGHT = 0.08;
 
-/** Weighted per-cell features; sample weights are reduced by the probability that a nearer piece covers them. */
-export function cellFeatures(fp: Footprints, s: Samples, pOcc: ArrayLike<number>): CellFeatures {
+/** Weighted per-cell features; sample weights are reduced by the probability that a nearer piece covers them.
+ *  `gain` (per cell) multiplies the linear colour first, to undo the local illumination. */
+export function cellFeatures(fp: Footprints, s: Samples, pOcc: ArrayLike<number>, gain?: ArrayLike<number>): CellFeatures {
   const x = new Float32Array(64 * NF);
   const vis = new Float32Array(64);
+  const logY = new Float32Array(64);
   const n = fp.n;
   const w = new Float32Array(n);
+  const Ls = new Float32Array(n);
   const idx: number[] = [];
   for (let c = 0; c < 64; c++) {
+    const k0 = gain ? gain[c]! : 1;
+    const kg = k0 === 1 ? 1 : k0 ** (1 / 2.2);
     let sw = 0;
     let st = 0;
     let sv = 0;
@@ -351,6 +356,7 @@ export function cellFeatures(fp: Footprints, s: Samples, pOcc: ArrayLike<number>
     let A = 0;
     let B = 0;
     let G = 0;
+    let Y = 0;
     idx.length = 0;
     for (let q = 0; q < n; q++) {
       const k = c * n + q;
@@ -363,21 +369,32 @@ export function cellFeatures(fp: Footprints, s: Samples, pOcc: ArrayLike<number>
       const ww = fp.w0[k]! * Math.max(MIN_OCC_WEIGHT, keep);
       w[q] = ww;
       sw += ww;
-      L += ww * s.L[k]!;
-      A += ww * s.a[k]!;
-      B += ww * s.b[k]!;
-      G += ww * s.g[k]!;
+      const r = s.r[k]! * k0;
+      const gr = s.gr[k]! * k0;
+      const bl = s.bl[k]! * k0;
+      const yl = 0.2126 * r + 0.7152 * gr + 0.0722 * bl;
+      const fx = labF((0.4124 * r + 0.3576 * gr + 0.1805 * bl) / 0.9505);
+      const fy = labF(yl);
+      const fz = labF((0.0193 * r + 0.1192 * gr + 0.9505 * bl) / 1.089);
+      const l = 116 * fy - 16;
+      Ls[q] = l;
+      Y += (ww * yl) / k0;
+      L += ww * l;
+      A += ww * 500 * (fx - fy);
+      B += ww * 200 * (fy - fz);
+      G += ww * s.g[k]! * kg;
       idx.push(q);
     }
     vis[c] = st > 0 ? sv / st : 0;
     if (sw <= 0) continue;
-    idx.sort((p, q) => s.L[c * n + p]! - s.L[c * n + q]!);
+    logY[c] = Math.log(Math.max(1e-4, Y / sw));
+    idx.sort((p, q) => Ls[p]! - Ls[q]!);
     let acc = 0;
     let p10 = NaN;
     let p90 = NaN;
     for (const q of idx) {
       acc += w[q]!;
-      const v = s.L[c * n + q]!;
+      const v = Ls[q]!;
       if (Number.isNaN(p10) && acc >= 0.1 * sw) p10 = v;
       if (Number.isNaN(p90) && acc >= 0.9 * sw) p90 = v;
     }
@@ -388,7 +405,66 @@ export function cellFeatures(fp: Footprints, s: Samples, pOcc: ArrayLike<number>
     x[o + 3] = p90 - p10;
     x[o + 4] = G / sw;
   }
-  return { x, vis };
+  return { x, vis, logY };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Illumination
+
+/**
+ * Lighting varies across the board (gradients, shadow bands), so absolute colour models fitted on one part of the
+ * board misread the rest. Each cell's log luminance is modelled as reflectance(class, parity) + illumination(cell),
+ * the illumination being estimated from the cell's neighbours (the median of their residuals, excluding the cell
+ * itself so a piece that just arrived does not correct itself away). Returns per-cell linear gains.
+ */
+/** Fewest neighbour residuals for the local illumination (the neighbourhood grows from 3x3 up to 7x7). */
+const ILLUM_MIN_NB = 4;
+
+function illumGains(feats: CellFeatures, grid: Uint8Array, refl: Float64Array): Float32Array {
+  const res = new Float32Array(64).fill(NaN);
+  const all: number[] = [];
+  for (let c = 0; c < 64; c++)
+    if (feats.vis[c]! >= VIS_FIT) {
+      res[c] = feats.logY[c]! - refl[grid[c]! * 2 + parityOf(c)]!;
+      all.push(res[c]!);
+    }
+  const gains = new Float32Array(64).fill(1);
+  if (all.length < 8) return gains;
+  const ref = medianOf(all);
+  const nb: number[] = [];
+  for (let c = 0; c < 64; c++) {
+    const i = c & 7;
+    const j = c >> 3;
+    for (let rad = 1; rad <= 3; rad++) {
+      nb.length = 0;
+      for (let dj = -rad; dj <= rad; dj++)
+        for (let di = -rad; di <= rad; di++) {
+          const ii = i + di;
+          const jj = j + dj;
+          if ((di === 0 && dj === 0) || ii < 0 || jj < 0 || ii > 7 || jj > 7) continue;
+          const v = res[jj * 8 + ii]!;
+          if (!Number.isNaN(v)) nb.push(v);
+        }
+      if (nb.length >= ILLUM_MIN_NB) break;
+    }
+    const I = nb.length ? medianOf(nb) : ref;
+    gains[c] = Math.exp(Math.max(-1.5, Math.min(1.5, ref - I)));
+  }
+  return gains;
+}
+
+/** Reflectance per (class, parity) and the illumination field, jointly from a labelled grid. */
+function fitIllum(feats: CellFeatures, grid: Uint8Array): { refl: Float64Array; gains: Float32Array } {
+  const refl = new Float64Array(6);
+  let gains: Float32Array = new Float32Array(64).fill(1);
+  for (let it = 0; it < 4; it++) {
+    const byK: number[][] = [[], [], [], [], [], []];
+    for (let c = 0; c < 64; c++) if (feats.vis[c]! >= VIS_FIT) byK[grid[c]! * 2 + parityOf(c)]!.push(feats.logY[c]! + Math.log(gains[c]!));
+    const allK = byK.flat();
+    for (let k = 0; k < 6; k++) refl[k] = byK[k]!.length ? medianOf(byK[k]!) : allK.length ? medianOf(allK) : 0;
+    gains = illumGains(feats, grid, refl);
+  }
+  return { refl, gains };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -463,6 +539,11 @@ export function startGrid(axis: number, side: number): Uint8Array {
 }
 
 const VIS_FIT = 0.4;
+/** Evidence weight kept by a cell that matches no class model. */
+const OUTLIER_EVIDENCE = 0.25;
+
+/** Occupancy prior of the occluder model from a grid (empty squares keep a small chance of a piece). */
+const priorOf = (grid: Uint8Array): number[] => Array.from(grid, (v) => (v === OCC_EMPTY ? 0.1 : 1));
 
 interface StartTest {
   score: number;
@@ -535,7 +616,7 @@ function fitModels(feats: CellFeatures, grid: Uint8Array, dev: number): Models |
 }
 
 /** Unsupervised fit: per-parity empty model (iterated median), occupied = deviating cells, 2-means on L. */
-function fitUnsupervised(feats: CellFeatures, dev: number): { models: Models; grid: Uint8Array } | null {
+function fitUnsupervised(feats: CellFeatures, dev: number): { grid: Uint8Array } | null {
   const { x, vis } = feats;
   const grid = new Uint8Array(64);
   const occupied: number[] = [];
@@ -566,8 +647,7 @@ function fitUnsupervised(feats: CellFeatures, dev: number): { models: Models; gr
   }
   const mid = (lo + hi) / 2;
   for (const c of occupied) grid[c] = x[c * NF]! >= mid ? OCC_WHITE : OCC_BLACK;
-  const models = fitModels(feats, grid, dev);
-  return models ? { models, grid } : null;
+  return { grid };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -656,6 +736,13 @@ export interface OccupancyResult {
   raw: Uint8Array;
   /** Per-cell confidence: classifier margin x visible fraction. */
   conf: Float32Array;
+  /**
+   * Per-cell class log-probabilities, cell c's (empty, white, black) at c * 3 + (0, 1, 2), normalised per cell
+   * (logsumexp = 0). Hidden / low-visibility cells and outliers are flattened towards uniform (log 1/3) in proportion
+   * to the evidence lost. All uniform before calibration and on frames without a camera. Intended for scoring
+   * candidate (legal) positions: sum logLik[c * 3 + class(c)] over the cells.
+   */
+  logLik: Float32Array;
   stats: OccupancyStats;
 }
 
@@ -664,6 +751,8 @@ export interface OccupancyDebug {
   weights: Float32Array;
   raw: Uint8Array;
   conf: Float32Array;
+  /** Illumination-corrected features of the frame. */
+  feats: CellFeatures;
 }
 
 /** The 8 relabellings of the board square: new board point (x, y) is old point g(x, y). */
@@ -709,6 +798,8 @@ export function dihedralRemap(prev: Mat3, hb: Mat3): Uint8Array | null {
  */
 export class OccupancyTracker {
   private models: Models | null = null;
+  /** Log reflectance per (class, parity) for the illumination field. */
+  private refl: Float64Array = new Float64Array(6);
   private state: OccupancyStats['state'] = 'start';
   private readonly filter = new OccupancyFilter();
   private bootKey = -1;
@@ -744,6 +835,7 @@ export class OccupancyTracker {
   update(frame: RawFrame, hb: Mat3, params: Params, nowMs: number): OccupancyResult {
     const raw = new Uint8Array(64);
     const conf = new Float32Array(64);
+    const logLik = new Float32Array(64 * 3).fill(-Math.log(3));
     if (Number.isNaN(this.firstSeenAt)) this.firstSeenAt = nowMs;
     // Keep the grid in hb's frame if the detector relabelled the board corners.
     if (this.lastHb) {
@@ -754,7 +846,7 @@ export class OccupancyTracker {
     const cam = cameraFromHomography(hb, frame.width, frame.height, param(params, OCCUPANCY_PARAMS, 'occFovDeg'));
     const fail = (): OccupancyResult => {
       this.lastStats = this.stats(0, true, false);
-      return { grid: null, raw, conf, stats: this.lastStats };
+      return { grid: null, raw, conf, logLik, stats: this.lastStats };
     };
     if (!cam) return fail();
     const fp = cellFootprints(cam, frame.width, frame.height, params);
@@ -764,19 +856,17 @@ export class OccupancyTracker {
     if (this.state !== 'calibrated') this.tryBootstrap(fp, s, params, dev);
     if (!this.models && nowMs - this.firstSeenAt > param(params, OCCUPANCY_PARAMS, 'occFallbackMs')) {
       const u = fitUnsupervised(cellFeatures(fp, s, new Float32Array(64).fill(0.3)), dev);
-      if (u) {
-        this.models = u.models;
-        this.state = 'fallback';
-        this.filter.reset(u.grid);
-      }
+      if (u && this.calibrate(fp, s, u.grid, dev)) this.state = 'fallback';
     }
     if (!this.models || !this.filter.committed) return fail();
 
     const committed = this.filter.committed;
-    const prior = Array.from(committed, (v) => (v === OCC_EMPTY ? 0.1 : 1));
-    const feats = cellFeatures(fp, s, prior);
+    const prior = priorOf(committed);
+    const feats = cellFeatures(fp, s, prior, illumGains(cellFeatures(fp, s, prior), committed, this.refl));
     const outlier = param(params, OCCUPANCY_PARAMS, 'occOutlier');
     const scale = param(params, OCCUPANCY_PARAMS, 'occMarginScale');
+    const temp = param(params, OCCUPANCY_PARAMS, 'occLikTemp');
+    const d3 = [0, 0, 0];
     let sum = 0;
     for (let c = 0; c < 64; c++) {
       const p = parityOf(c);
@@ -787,6 +877,7 @@ export class OccupancyTracker {
       for (let cls = 0; cls < 3; cls++) {
         const g = this.models[cls]![p]!;
         const d = nll(feats.x, c, g);
+        d3[cls] = d;
         near = Math.min(near, zdist(feats.x, c, g));
         if (d < best) {
           second = best;
@@ -795,6 +886,15 @@ export class OccupancyTracker {
         } else if (d < second) second = d;
       }
       raw[c] = arg;
+      // Evidence weight: visible fraction, reduced for outliers (hand, glare) that match no model.
+      const ew = Math.max(0, Math.min(1, feats.vis[c]!)) * (near > outlier ? OUTLIER_EVIDENCE : 1);
+      let lse = -Infinity;
+      for (let cls = 0; cls < 3; cls++) {
+        const l = (-(d3[cls]! - best) / temp) * ew;
+        logLik[c * 3 + cls] = l;
+        lse = Math.max(lse, l) + Math.log1p(Math.exp(-Math.abs(lse - l)));
+      }
+      for (let cls = 0; cls < 3; cls++) logLik[c * 3 + cls]! -= lse;
       conf[c] = near > outlier ? 0 : Math.min(1, (second - best) / scale) * Math.min(1, feats.vis[c]!);
       sum += conf[c]!;
     }
@@ -807,9 +907,9 @@ export class OccupancyTracker {
       frozen = this.filter.update(raw, conf, params, nowMs);
       this.learn(feats, raw, conf, params);
     }
-    this.debug = { fp, weights: this.weights(fp, prior), raw, conf };
+    this.debug = { fp, weights: this.weights(fp, prior), raw, conf, feats };
     this.lastStats = this.stats(low, dropped, frozen);
-    return { grid: dropped ? null : new Uint8Array(this.filter.committed), raw, conf, stats: this.lastStats };
+    return { grid: dropped ? null : new Uint8Array(this.filter.committed), raw, conf, logLik, stats: this.lastStats };
   }
 
   private tryBootstrap(fp: Footprints, s: Samples, params: Params, dev: number): void {
@@ -825,12 +925,20 @@ export class OccupancyTracker {
     this.bootCount = key === this.bootKey ? this.bootCount + 1 : 1;
     this.bootKey = key;
     if (this.bootCount < param(params, OCCUPANCY_PARAMS, 'occBootFrames')) return;
-    const grid = startGrid(axis, t.side);
-    const models = fitModels(t.feats, grid, dev);
-    if (!models) return;
+    if (this.calibrate(fp, s, startGrid(axis, t.side), dev)) this.state = 'calibrated';
+  }
+
+  /** Fits the illumination (reflectance per class and parity) and the class models on a labelled frame, using the
+   *  same occupancy prior as `update` so the models describe exactly the features `update` computes. */
+  private calibrate(fp: Footprints, s: Samples, grid: Uint8Array, dev: number): boolean {
+    const prior = priorOf(grid);
+    const il = fitIllum(cellFeatures(fp, s, prior), grid);
+    const models = fitModels(cellFeatures(fp, s, prior, il.gains), grid, dev);
+    if (!models) return false;
     this.models = models;
-    this.state = 'calibrated';
+    this.refl = il.refl;
     this.filter.reset(grid);
+    return true;
   }
 
   /** Slow EMA update of the class models from confident cells that agree with the committed grid. */
