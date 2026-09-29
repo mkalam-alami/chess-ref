@@ -634,9 +634,10 @@ describe('orientation on rendered boards', () => {
     const path = [25, 50, 75, 100, 125, 150, 150, 150, 150, 125, 100, 75, 50, 25, 0];
     for (const dx of path) {
       o = step(tr, calls, shifted(dx), (t += 100));
-      // Frozen for occSettleMs after the last frame not in view.
+      // Frozen after the last frame not in view until it settles: one reference frame, then occSettleFrames (2)
+      // calm frames (100 ms apart here, so 300 ms; the occSettleMs cap is 400).
       if (!o.observation.framed) lastCrop = t;
-      else expect(o.observation.stable).toBe(t - lastCrop >= 400);
+      else expect(o.observation.stable).toBe(t - lastCrop >= 300);
       // The orientation is kept throughout.
       expect(same(o.orientation, orient)).toBe(true);
     }
@@ -650,7 +651,7 @@ describe('orientation on rendered boards', () => {
     for (let i = 0; i < 6; i++) {
       o = step(tr, calls, b, (t += 100), [0, 0, W, H]);
       expect(o.observation.framed).toBe(true);
-      expect(o.observation.stable).toBe(t - lastCrop >= 400);
+      expect(o.observation.stable).toBe(t - lastCrop >= 300);
     }
     expect(o.observation.stable).toBe(true);
     // Nothing was committed from the cropped frames.
@@ -664,6 +665,49 @@ describe('orientation on rendered boards', () => {
     expect(same(tr.orientation, orient)).toBe(true);
   });
 
+  it('a hand over the board is unstable; the board settles two calm frames after it is gone, before occSettleMs', () => {
+    for (const [seed, elev, palette] of [DARK[0]!, DARK[2]!]) {
+      const b = board(seed, elev, palette);
+      const moved = board(seed, elev, palette, 1); // 1. e4
+      /** The frame with a skin-coloured blob over board cells [x0, x1) x [y0, y1) (image-space bounding box). */
+      const withHand = (f: Board['frame'], x0: number, y0: number, x1: number, y1: number) => {
+        const data = new Uint8ClampedArray(f.data);
+        const pts = ([[x0, y0], [x1, y0], [x1, y1], [x0, y1]] as Point[]).map((p) => applyH(b.hb, p));
+        const [ax, bx] = [Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0]))];
+        const [ay, by] = [Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[1]))];
+        for (let y = Math.max(0, Math.floor(ay)); y < Math.min(H, by); y++)
+          for (let x = Math.max(0, Math.floor(ax)); x < Math.min(W, bx); x++) {
+            const o = (y * W + x) * 4;
+            const n = ((x * 7 + y * 13) % 11) - 5;
+            data[o] = 215 + n;
+            data[o + 1] = 160 + n;
+            data[o + 2] = 125 + n;
+          }
+        return { data, width: W, height: H };
+      };
+      const { tr, t: t0 } = calibrate(b);
+      expect(tr.orientation).not.toBeNull();
+      let t = t0;
+      expect(tr.update(b.frame, b.hb, P, (t += 66)).observation.stable).toBe(true);
+      // The hand reaches over the board, picks up e2 and puts it on e4.
+      const boxes: [number, number, number, number][] = [[2, 0, 6, 4], [3, 0, 6, 5], [2, 0, 7, 5]];
+      for (const box of boxes) {
+        const o = tr.update(withHand(b.frame, ...box), b.hb, P, (t += 66));
+        expect(o.observation.stable).toBe(false);
+      }
+      const handAt = t;
+      // Leaving: a remnant over two edge cells (the cells the hand left flip back, or read as outliers): still frozen.
+      const rem = tr.update(withHand(moved.frame, 3, 0, 5, 1), moved.hb, P, (t += 66));
+      expect(rem.observation.stable).toBe(false);
+      const lastHand = t;
+      const outs = [1, 2, 3].map(() => tr.update(moved.frame, moved.hb, P, (t += 66)));
+      expect(t - handAt).toBeLessThan(400);
+      // Stable from the second clean frame on (2 calm frames, >= occSettleMinMs after the last unstable one).
+      expect(outs.map((o) => o.observation.stable)).toEqual([false, true, true]);
+      expect(t - 66 - lastHand).toBeLessThan(400);
+    }
+  });
+
   it('keeps the models and orientation across noBoard; stable is false while settling; only reset() drops them', () => {
     const b = board(...DARK[0]!);
     const fresh = new OccupancyTracker().update(b.frame, b.hb, P, 0);
@@ -673,18 +717,26 @@ describe('orientation on rendered boards', () => {
     const { tr, t: t0 } = calibrate(b);
     const orient = tr.orientation!;
     let t = t0;
-    // Short loss (< occLossMs): orientation kept; frozen for occSettleMs after the board-less frame.
+    // Short loss (< occLossMs): orientation kept; frozen after the board-less frame until settled (a reference frame,
+    // then 2 calm frames).
     tr.noBoard((t += 100));
     const lostAt = t;
-    let o = tr.update(b.frame, b.hb, P, (t += 100));
+    let o = tr.update(b.frame, b.hb, P, (t += 66));
     expect(same(o.orientation, orient)).toBe(true);
     expect(o.observation.oriented).toBe(true);
     expect(o.observation.calibration).toBe('calibrated');
     expect(o.observation.stable).toBe(false);
     expect(o.stats.frozen).toBe(true);
-    o = tr.update(b.frame, b.hb, P, lostAt + 350);
+    o = tr.update(b.frame, b.hb, P, (t += 66));
     expect(o.observation.stable).toBe(false);
-    o = tr.update(b.frame, b.hb, P, (t = lostAt + 450));
+    o = tr.update(b.frame, b.hb, P, (t += 66));
+    expect(t - lostAt).toBeLessThan(400);
+    expect(o.observation.stable).toBe(true);
+    // With a slow frame rate the occSettleMs cap ends the settle: the reference at +300, one calm frame at +400.
+    tr.noBoard((t += 100));
+    o = tr.update(b.frame, b.hb, P, (t += 300));
+    expect(o.observation.stable).toBe(false);
+    o = tr.update(b.frame, b.hb, P, (t += 100));
     expect(o.observation.stable).toBe(true);
     // Long loss: the models survive, the orientation is re-verified (not dropped) and comes back.
     tr.noBoard((t += 100));

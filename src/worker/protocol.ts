@@ -123,7 +123,8 @@ export interface Observation {
   /** Occupancy calibration state (OccupancyStats.state); the game only locks in on 'calibrated' (from the start position). */
   calibration: OccupancyStats['state'];
   /** False on frames that must not count as evidence: dropped, frozen (hand / mass change), just after a board loss,
-   *  not `framed`, or within `occSettleMs` of the board coming back fully into view. */
+   *  not `framed`, or while the board settles after any of these (adaptive: `occSettleFrames` calm frames and at
+   *  least `occSettleMinMs`, at most `occSettleMs`; see OccupancyFilter in src/vision/occupancy.ts). */
   stable: boolean;
   /** Whether the whole board, far-rank piece tops included, is inside the visible part of the frame (see
    *  FrameMessage.visibleRect). A partly cropped board reads wrong near the edge, so such frames never count. */

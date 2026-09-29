@@ -142,21 +142,99 @@ describe('OccupancyFilter', () => {
     expect(f.committed![40]).toBe(OCC_EMPTY);
   });
 
-  it('freezes on a mass change and commits once the board is stable for the settle time', () => {
+  it('freezes on a mass change; with hand remnants (outliers) the settle lasts the full occSettleMs cap', () => {
     const f = new OccupancyFilter();
     f.reset(startGrid(0, 0));
     const hand = startGrid(0, 0);
     for (let c = 16; c < 26; c++) hand[c] = OCC_BLACK;
     f.update(startGrid(0, 0), conf, params, 0);
     expect(f.update(hand, conf, params, 50)).toBe(true); // 10 cells flipped at once
-    f.update(hand, conf, params, 100);
-    f.update(hand, conf, params, 150);
-    f.update(hand, conf, params, 300);
-    expect(f.committed![20]).toBe(OCC_EMPTY); // still frozen (settle 400 ms from t = 50)
-    f.update(hand, conf, params, 460);
+    // No flips any more, but 2 cells match no class model (a hand remnant): never calm.
+    expect(f.update(hand, conf, params, 100, true, 2)).toBe(true);
+    expect(f.update(hand, conf, params, 150, true, 2)).toBe(true);
+    expect(f.update(hand, conf, params, 300, true, 2)).toBe(true);
+    expect(f.committed![20]).toBe(OCC_EMPTY); // still frozen (cap: 400 ms from t = 50)
+    expect(f.update(hand, conf, params, 460, true, 2)).toBe(false);
     expect(f.committed![20]).toBe(OCC_BLACK);
     f.noBoard(500);
     expect(f.frozen(700, params)).toBe(true);
+    expect(f.frozen(900, params)).toBe(false);
+  });
+
+  it('adaptive settle: occSettleFrames calm frames end it early, not before occSettleMinMs', () => {
+    const f = new OccupancyFilter();
+    const start = startGrid(0, 0);
+    f.reset(start);
+    const hand = startGrid(0, 0);
+    for (let c = 16; c < 26; c++) hand[c] = OCC_BLACK;
+    const moved = new Uint8Array(start);
+    moved[12] = OCC_EMPTY;
+    moved[28] = OCC_WHITE;
+    f.update(start, conf, params, 0);
+    expect(f.update(hand, conf, params, 66)).toBe(true); // hand frames: mass flips, unstable
+    expect(f.update(start, conf, params, 133)).toBe(true); // hand gone: 10 cells flip back, still unstable
+    expect(f.update(moved, conf, params, 200)).toBe(true); // calm 1 (2 flips: the move)
+    expect(f.update(moved, conf, params, 266)).toBe(false); // calm 2, 133 ms after the last unstable frame
+    // The floor: two calm frames in quick succession do not end the settle before occSettleMinMs.
+    f.update(hand, conf, params, 1000);
+    expect(f.update(start, conf, params, 1010)).toBe(true); // unstable (flips back)
+    expect(f.update(start, conf, params, 1030)).toBe(true); // calm 1
+    expect(f.update(start, conf, params, 1060)).toBe(true); // calm 2, but only 50 ms
+    expect(f.frozen(1109, params)).toBe(true);
+    expect(f.frozen(1110, params)).toBe(false);
+    // Legacy behaviour: occSettleFrames above what the frame rate delivers in occSettleMs = the fixed settle.
+    const fixed = { ...params, occSettleFrames: 10 };
+    f.update(hand, conf, fixed, 2000);
+    for (let t = 2066; t < 2400; t += 66) expect(f.update(hand, conf, fixed, t)).toBe(true);
+    expect(f.update(hand, conf, fixed, 2400)).toBe(false);
+  });
+
+  it('adaptive settle: continued flipping stays frozen; the cap counts from the last unstable frame', () => {
+    const f = new OccupancyFilter();
+    const start = startGrid(0, 0);
+    f.reset(start);
+    const hand = startGrid(0, 0);
+    for (let c = 16; c < 26; c++) hand[c] = OCC_BLACK;
+    f.update(start, conf, params, 0);
+    // A hand moving over the board for 1.5 s: every frame flips 10 cells.
+    let t = 0;
+    for (let i = 1; i <= 22; i++) expect(f.update(i & 1 ? hand : start, conf, params, (t = i * 66))).toBe(true);
+    // Then small flips (1-5 cells per frame: neither unstable nor calm) with outliers: frozen up to the cap.
+    const wobble = (k: number) => {
+      const g = new Uint8Array(start);
+      for (let c = 40; c < 40 + (k % 5) + 1; c++) g[c] = OCC_WHITE;
+      return g;
+    };
+    const lastUnstable = t;
+    for (let k = 0; k < 10; k++) {
+      t += 66;
+      expect(f.update(wobble(k), conf, params, t, true, 1)).toBe(t - lastUnstable < 400);
+    }
+  });
+
+  it('adaptive settle: the first frame after a board loss is a reference, not a calm frame', () => {
+    const f = new OccupancyFilter();
+    const start = startGrid(0, 0);
+    f.reset(start);
+    f.update(start, conf, params, 0);
+    f.noBoard(100);
+    expect(f.update(start, conf, params, 166)).toBe(true); // reference
+    expect(f.update(start, conf, params, 233)).toBe(true); // calm 1
+    expect(f.update(start, conf, params, 300)).toBe(false); // calm 2
+    // markUnstable (a dropped frame) keeps the reference: two frames after it suffice.
+    f.markUnstable(400);
+    expect(f.update(start, conf, params, 466)).toBe(true); // calm 1
+    expect(f.update(start, conf, params, 533)).toBe(false); // calm 2
+    // Steady glare: an outlier cell seen on settled frames is the baseline and does not block the early settle.
+    f.update(start, conf, params, 600, true, 1);
+    f.markUnstable(700);
+    expect(f.update(start, conf, params, 766, true, 1)).toBe(true);
+    expect(f.update(start, conf, params, 833, true, 1)).toBe(false);
+    // One more outlier than the baseline (occSettleOutliers 0) does.
+    f.markUnstable(900);
+    expect(f.update(start, conf, params, 966, true, 2)).toBe(true);
+    expect(f.update(start, conf, params, 1033, true, 2)).toBe(true);
+    expect(f.update(start, conf, params, 1300, true, 2)).toBe(false); // cap
   });
 });
 

@@ -30,8 +30,17 @@ export const OCCUPANCY_PARAMS: readonly ParamSpec[] = [
   { name: 'occHoldFrames', min: 1, max: 10, step: 1, default: 3 },
   /** This many cells flipping between consecutive frames freezes commits (hand over the board). */
   { name: 'occFreezeCells', min: 2, max: 32, step: 1, default: 6 },
-  /** After a freeze (or a frame without board), the board must be stable this long before commits resume. */
+  /** Settle after an unstable frame (mass change, dropped frame, no board, board not framed): the longest wait (ms)
+   *  before commits resume, reached when the board does not calm down earlier (see OccupancyFilter). 0 = no settle. */
   { name: 'occSettleMs', min: 0, max: 2000, step: 50, default: 400 },
+  /** Settle ends early after this many consecutive calm frames (fewer than occFreezeCells flips, no outlier cells
+   *  beyond the calm baseline) ... */
+  { name: 'occSettleFrames', min: 1, max: 10, step: 1, default: 2 },
+  /** ... but never less than this (ms) after the last unstable frame. */
+  { name: 'occSettleMinMs', min: 0, max: 1000, step: 25, default: 100 },
+  /** Outlier cells (matching no class model: hand remnants, glare) a calm frame may have beyond the calm baseline
+   *  (the outlier count of the last settled frame). */
+  { name: 'occSettleOutliers', min: 0, max: 16, step: 1, default: 0 },
   /** Consecutive frames the starting position must be recognised before calibrating on it. */
   { name: 'occBootFrames', min: 1, max: 10, step: 1, default: 2 },
   /** Without a starting position for this long, calibrate unsupervised. */
@@ -701,9 +710,21 @@ function fitUnsupervised(feats: CellFeatures, dev: number): { grid: Uint8Array }
 // Temporal filter
 
 /**
- * Per-cell hysteresis: a cell changes its committed state after `occHoldFrames` consistent frames. Commits are
- * frozen while many cells flip between consecutive frames (a hand over the board) or the board was lost, until the
- * board has been stable for `occSettleMs`.
+ * Per-cell hysteresis: a cell changes its committed state after `occHoldFrames` consistent frames.
+ *
+ * Freeze / settle. A frame is *unstable* when `occFreezeCells` or more cells flip between consecutive frames (a hand
+ * over the board), when it is dropped (markUnstable) or when there is no board / the board is not wholly in view
+ * (noBoard). Commits are frozen after the last unstable frame until the board has *settled*, adaptively:
+ * - early, once `occSettleFrames` consecutive *calm* frames followed it and at least `occSettleMinMs` passed. A calm
+ *   frame has fewer than `occFreezeCells` flips against the previous frame, a reference to compare with (the first
+ *   frame after noBoard is not calm), and no more outlier cells (matching no class model: hand remnants) than the
+ *   calm baseline (the count on the last settled frame, so steady glare does not block the early settle) plus
+ *   `occSettleOutliers`;
+ * - at the latest `occSettleMs` after the last unstable frame (the cap: the board then counts as settled even if
+ *   it never calmed, e.g. a persistent outlier cell or a run of 1-5 flips per frame).
+ * Continued mass flipping keeps re-marking frames unstable, so the board stays frozen for as long as it lasts and
+ * then at most `occSettleMs` more. A frame that is neither unstable nor calm restarts the calm count; once settled,
+ * only a new unstable frame freezes again.
  */
 export class OccupancyFilter {
   committed: Uint8Array | null = null;
@@ -712,22 +733,43 @@ export class OccupancyFilter {
   /** Last confident raw state per cell (255 = none). */
   private readonly prev = new Uint8Array(64).fill(255);
   private unstableAt = -Infinity;
+  /** Consecutive calm frames since the last unstable one. */
+  private calm = 0;
+  /** Outlier cells of the last settled (not frozen) frame. */
+  private calmOutliers = 0;
+  /** Whether an update found the board settled since the last unstable frame (then only a new unstable frame
+   *  freezes again: a later non-calm frame does not). */
+  private settled = true;
 
   reset(grid: Uint8Array | null = null): void {
     this.committed = grid ? new Uint8Array(grid) : null;
     this.count.fill(0);
     this.prev.fill(255);
     this.unstableAt = -Infinity;
+    this.calm = 0;
+    this.calmOutliers = 0;
+    this.settled = true;
   }
 
-  /** Board not seen (or tracking lost): freeze. */
+  /** Board not seen, tracking lost or board not wholly in view: unstable, and the next frame has no reference. */
   noBoard(nowMs: number): void {
-    this.unstableAt = nowMs;
+    this.markUnstable(nowMs);
     this.prev.fill(255);
   }
 
+  /** An unstable frame that keeps the per-cell reference (a dropped frame, typically a hand over the board). */
+  markUnstable(nowMs: number): void {
+    this.unstableAt = nowMs;
+    this.calm = 0;
+    this.settled = false;
+  }
+
   frozen(nowMs: number, params: Params): boolean {
-    return nowMs - this.unstableAt < param(params, OCCUPANCY_PARAMS, 'occSettleMs');
+    if (this.settled) return false;
+    const since = nowMs - this.unstableAt;
+    if (!(since < param(params, OCCUPANCY_PARAMS, 'occSettleMs'))) return false;
+    if (since < param(params, OCCUPANCY_PARAMS, 'occSettleMinMs')) return true;
+    return this.calm < param(params, OCCUPANCY_PARAMS, 'occSettleFrames');
   }
 
   /** Overrides the committed grid (position hint) without touching the freeze state. */
@@ -739,16 +781,29 @@ export class OccupancyFilter {
   /**
    * Cells with conf below `occCellMin` are ignored. Returns whether commits are frozen. With `commit` false (a
    * position hint owns the committed grid) only the freeze detection runs: the committed grid and the per-cell
-   * hysteresis are left alone.
+   * hysteresis are left alone. `outliers` is the frame's count of visible cells that match no class model (see the
+   * class doc: the settle).
    */
-  update(raw: Uint8Array, conf: Float32Array, params: Params, nowMs: number, commit = true): boolean {
+  update(raw: Uint8Array, conf: Float32Array, params: Params, nowMs: number, commit = true, outliers = 0): boolean {
     if (!this.committed) this.committed = new Uint8Array(raw);
     const cellMin = param(params, OCCUPANCY_PARAMS, 'occCellMin');
     const hold = param(params, OCCUPANCY_PARAMS, 'occHoldFrames');
     let flips = 0;
-    for (let c = 0; c < 64; c++) if (conf[c]! >= cellMin && this.prev[c] !== 255 && this.prev[c] !== raw[c]) flips++;
-    if (flips >= param(params, OCCUPANCY_PARAMS, 'occFreezeCells')) this.unstableAt = nowMs;
+    let compared = 0;
+    for (let c = 0; c < 64; c++) {
+      if (conf[c]! < cellMin || this.prev[c] === 255) continue;
+      compared++;
+      if (this.prev[c] !== raw[c]) flips++;
+    }
+    if (flips >= param(params, OCCUPANCY_PARAMS, 'occFreezeCells')) this.markUnstable(nowMs);
+    else if (compared > 0 && outliers <= this.calmOutliers + param(params, OCCUPANCY_PARAMS, 'occSettleOutliers'))
+      this.calm = Math.min(255, this.calm + 1);
+    else this.calm = 0;
     const frozen = this.frozen(nowMs, params);
+    if (!frozen) {
+      this.settled = true;
+      this.calmOutliers = outliers;
+    }
     for (let c = 0; c < 64; c++) {
       if (conf[c]! < cellMin) continue;
       const r = raw[c]!;
@@ -815,8 +870,8 @@ export interface OccupancyResult {
   /**
    * The frame's evidence for the game layer: logLik and the visible fractions in chess square order when oriented
    * (board cell order otherwise), the calibration state, `framed` (see boardFramed) and `stable` = framed, calibrated,
-   * not dropped and not frozen (a freeze covers mass changes such as a hand, and the `occSettleMs` after any frame
-   * without a board or with the board not fully in view).
+   * not dropped and not frozen (a freeze covers mass changes such as a hand, dropped frames, frames without a board or
+   * with the board not fully in view, and the settle after them: see OccupancyFilter).
    */
   observation: Observation;
   /** orientation[sq] = board cell of chess square sq (a1 = 0 ... h8 = 63); null while not oriented. */
@@ -1077,7 +1132,7 @@ export class OccupancyTracker {
   /**
    * One frame with a board. `visibleRect` (default: the whole frame) is the part of the frame the user sees; when the
    * board is not wholly inside it (boardFramed) the frame is treated like a hand over the board: the filter freezes
-   * (commits resume `occSettleMs` after the board is fully back), nothing is calibrated, learnt or oriented, and the
+   * (commits resume once the board has settled after it is fully back, see OccupancyFilter), nothing is calibrated, learnt or oriented, and the
    * result is `stable` = `framed` = false with no grid. Occupancy is still computed (debug view, committedProb).
    */
   update(frame: RawFrame, hb: Mat3, params: Params, nowMs: number, visibleRect?: FrameRect): OccupancyResult {
@@ -1148,6 +1203,7 @@ export class OccupancyTracker {
     const visGamma = param(params, OCCUPANCY_PARAMS, 'occLikVisGamma');
     const d3 = [0, 0, 0];
     let sum = 0;
+    let outliers = 0;
     for (let c = 0; c < 64; c++) {
       const p = parityOf(c);
       let best = Infinity;
@@ -1176,15 +1232,18 @@ export class OccupancyTracker {
       }
       for (let cls = 0; cls < 3; cls++) logLik[c * 3 + cls]! -= lse;
       conf[c] = near > outlier ? 0 : Math.min(1, (second - best) / scale) * Math.min(1, feats.vis[c]!);
+      if (near > outlier && feats.vis[c]! >= VIS_FIT) outliers++;
       sum += conf[c]!;
     }
     const cellMin = param(params, OCCUPANCY_PARAMS, 'occCellMin');
     let low = 0;
     for (let c = 0; c < 64; c++) if (conf[c]! < cellMin) low++;
     const dropped = low > param(params, OCCUPANCY_PARAMS, 'occMaxLowCells') || sum / 64 < param(params, OCCUPANCY_PARAMS, 'occFrameMin');
+    // A dropped frame (typically a hand over the board) is unstable: the settle restarts from it.
+    if (dropped && framed) this.filter.markUnstable(nowMs);
     let frozen = this.filter.frozen(nowMs, params);
     if (!dropped && framed) {
-      frozen = this.filter.update(raw, conf, params, nowMs, !hintCells);
+      frozen = this.filter.update(raw, conf, params, nowMs, !hintCells, outliers);
       if (!stale) this.learn(feats, raw, conf, this.filter.committed!, params);
     }
     const stable = framed && !dropped && !frozen;
