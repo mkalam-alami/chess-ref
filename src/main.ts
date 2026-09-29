@@ -10,10 +10,15 @@ import {
   type CameraInfo,
   type FrameSource,
 } from './camera';
-import { DebugPanel, fillCameraSelect, formatOccupancy, getParams, registerParam } from './debug/panel';
+import { DebugPanel, fillCameraSelect, formatGame, formatOccupancy, getParams, registerParam } from './debug/panel';
+import { GameTracker } from './game/game';
+import type { GameEvent, GameSnapshot } from './game/types';
 import { isSimpleQuad } from './geom/cornerOrder';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS } from './overlay';
+import { MoveList, statusText } from './ui/moves';
+import { pieceImage, preloadPieces } from './ui/pieces';
+import { archivePgn, loadSavedGame, saveGame, unarchiveLast } from './ui/storage';
 import { ALL_PARAMS } from './vision/detector';
 import { describeProfile } from './vision/profile';
 import type { FrameMessage, OccupancyStats, ResultMessage, WorkerToMain } from './worker/protocol';
@@ -30,6 +35,8 @@ const setWorker = (s: string) => (app.dataset.worker = s);
 for (const p of ALL_PARAMS) registerParam(p.name, p.min, p.max, p.step, p.default);
 
 const overlay = new Overlay($<HTMLCanvasElement>('overlay'));
+preloadPieces();
+overlay.setPieceImages(pieceImage);
 const panel = new DebugPanel(app);
 const grabber = new FrameGrabber(panel.resolution);
 panel.onResolutionChange((r) => (grabber.longSide = r));
@@ -56,6 +63,9 @@ let profileText = describeProfile(null);
 const resetBoardBtn = $<HTMLButtonElement>('resetBoard');
 resetBoardBtn.addEventListener('click', () => {
   worker.postMessage({ type: 'resetProfile' });
+  // The game survives a board reset; re-send its position to the fresh occupancy state.
+  hintKey = '';
+  sendHint();
   resetBoardBtn.hidden = true;
   profileText = describeProfile(null);
 });
@@ -63,7 +73,12 @@ const modeCounts = { full: 0, tracking: 0 };
 
 // The worker keeps corners[k] = board corner k across frames (orientation is stabilised in TrackingSession), so
 // the quad is only smoothed here, never reordered: reordering would misalign the occupancy grid.
-const tracker = { filter: new PointsFilter(4, 1.0, 0.02), grid: null as Uint8Array | null, prob: null as Float32Array | null };
+const tracker = {
+  filter: new PointsFilter(4, 1.0, 0.02),
+  grid: null as Uint8Array | null,
+  prob: null as Float32Array | null,
+  orientation: null as Uint8Array | null,
+};
 let occStats: OccupancyStats | undefined;
 /** (time, dropped) per result carrying occupancy stats, over the last ~2 s. */
 const occDrops: Array<[number, boolean]> = [];
@@ -122,12 +137,17 @@ function handleResult(r: ResultMessage): void {
     r.debugImage?.close();
     overlay.setDebugImage(null);
   }
+  if (r.observation) {
+    obsTime = r.observation.t;
+    handleGameEvents(game.observe(r.observation));
+  }
   if (r.corners) {
     // Reset smoothing after the quad has fully faded so stale state does not drag the new one.
     if (overlay.msSinceQuad(now) > HOLD_MS + FADE_MS) {
       tracker.filter.reset();
       tracker.grid = null;
       tracker.prob = null;
+      tracker.orientation = null;
     }
     // Never draw a bow-tie: drop the result (the previous quad and grid are held / fade).
     if (isSimpleQuad(r.corners)) {
@@ -135,9 +155,126 @@ function handleResult(r: ResultMessage): void {
       if (r.occupancy) tracker.grid = r.occupancy;
       // Confidence of the committed classes, also sent on dropped frames; a null keeps the previous one.
       if (r.occupancyProb) tracker.prob = r.occupancyProb;
-      overlay.setQuad(tracker.filter.filter(r.corners, now / 1000), r.width, r.height, now, tracker.grid, tracker.grid ? tracker.prob : null);
+      // Orientation (square -> cell) is held with the quad like the grid; a null result keeps the previous one.
+      if (r.orientation) tracker.orientation = r.orientation;
+      overlay.setQuad(tracker.filter.filter(r.corners, now / 1000), r.width, r.height, now, tracker.grid, tracker.grid ? tracker.prob : null, tracker.orientation);
     }
   }
+}
+
+// ---- Game (milestone 9): runs on the main thread, fed by the worker's observations. ----
+
+const game = new GameTracker();
+/** Latest observation time: the clock of PlyInfo.correctedAt (worker performance.now()). */
+let obsTime = -Infinity;
+let snapshot: GameSnapshot = game.snapshot();
+/** Last game.save() written to storage: the state to restore when an automatic new game is undone. */
+let savedGame = '';
+/** Last grid sent to the worker as a position hint ('' = none sent yet). */
+let hintKey = '';
+const gameChip = $('gameChip');
+
+const moves = new MoveList($('moves'), {
+  copy: () => void copyPgn(),
+  undo: () => handleGameEvents(game.undo(), true),
+  newGame: () => {
+    const prevSave = game.save();
+    const prevPgn = game.pgn(pgnHeaders());
+    archivePgn(prevPgn);
+    game.newGame();
+    handleGameEvents([], true);
+    offerUndoNewGame(prevSave, prevPgn, 'New game');
+  },
+  continueAfterDesync: () => {
+    game.continueAfterDesync();
+    handleGameEvents([], true);
+  },
+  promote: (ply, piece) => {
+    if (!game.setPromotion(ply, piece)) showNotice('That promotion is not possible here.');
+    handleGameEvents([], true);
+  },
+});
+
+function pgnHeaders(): Record<string, string> {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return { Date: `${d.getFullYear()}.${pad(d.getMonth() + 1)}.${pad(d.getDate())}` };
+}
+
+async function copyPgn(): Promise<void> {
+  const pgn = game.pgn(pgnHeaders());
+  try {
+    await navigator.clipboard.writeText(pgn);
+    showNotice('PGN copied');
+  } catch {
+    moves.showPgn(pgn);
+    showNotice('Copy the selected PGN');
+  }
+}
+
+/** Toast after a new game (automatic or from the button) with an Undo that restores the previous game. */
+function offerUndoNewGame(prevSave: string, prevPgn: string, text: string): void {
+  showNotice(text, 8000, {
+    label: 'Undo',
+    run: () => {
+      if (prevSave && game.load(prevSave)) {
+        unarchiveLast(prevPgn);
+        handleGameEvents([], true);
+      } else {
+        showNotice('Could not restore the previous game.');
+      }
+    },
+  });
+}
+
+/** Grid hint for the worker: the game's expected occupancy while playing, else none. */
+function sendHint(): void {
+  const grid = snapshot.state === 'playing' ? snapshot.grid : null;
+  const key = grid ? grid.join('') : 'null';
+  if (key === hintKey) return;
+  hintKey = key;
+  worker.postMessage({ type: 'positionHint', grid });
+}
+
+/**
+ * Applies the effects of game events (or of a UI command when `changed`): refreshes the snapshot, the sidebar, the
+ * overlay and the position hint, and persists the game.
+ */
+function handleGameEvents(events: GameEvent[], changed = false): void {
+  const prevState = snapshot.state;
+  if (events.length === 0 && !changed) {
+    // Nothing happened, but snapshots also carry debug scores: refresh them only while the panel shows them.
+    if (panel.visible) snapshot = game.snapshot();
+    return;
+  }
+  const prevSave = savedGame;
+  snapshot = game.snapshot();
+  for (const e of events) {
+    if (e.type === 'newGame') {
+      archivePgn(e.previousPgn);
+      offerUndoNewGame(prevSave, e.previousPgn, 'New game started');
+    }
+  }
+  savedGame = game.save();
+  saveGame(savedGame);
+  if (snapshot.state !== prevState) console.debug(`game: ${prevState} -> ${snapshot.state}`);
+  renderGame();
+}
+
+function renderGame(): void {
+  app.dataset.game = snapshot.state;
+  moves.render(snapshot, obsTime);
+  overlay.setGame(snapshot.state === 'waiting' ? null : { pieces: snapshot.pieces, lastMove: snapshot.lastMove });
+  gameChip.textContent = statusText(snapshot);
+  sendHint();
+}
+
+{
+  const saved = loadSavedGame();
+  if (saved && !game.load(saved)) saveGame('');
+  snapshot = game.snapshot();
+  savedGame = saved && snapshot.state !== 'waiting' ? saved : '';
+  renderGame();
 }
 
 function occupancyText(): string {
@@ -152,12 +289,24 @@ function showError(text: string): void {
   running = false;
   updateLoading();
   setStatus('error');
+  moves.root.hidden = true;
+  gameChip.hidden = true;
 }
 
 let notices = 0;
-function showNotice(text: string, ms = 4000): void {
+function showNotice(text: string, ms = 4000, action?: { label: string; run: () => void }): void {
   const n = $('notice');
   n.textContent = text;
+  if (action) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = action.label;
+    b.addEventListener('click', () => {
+      n.hidden = true;
+      action.run();
+    });
+    n.append(b);
+  }
   n.hidden = false;
   const k = ++notices;
   setTimeout(() => k === notices && (n.hidden = true), ms);
@@ -201,7 +350,12 @@ async function begin(open: () => Promise<FrameSource>, fullscreen: boolean): Pro
   tracker.filter.reset();
   tracker.grid = null;
   tracker.prob = null;
+  tracker.orientation = null;
+  // Only vision resets on a source change; the game carries on (re-sent as a hint to the fresh tracker).
   worker.postMessage({ type: 'reset' });
+  hintKey = '';
+  sendHint();
+  moves.root.hidden = false;
   modeCounts.full = modeCounts.tracking = 0;
   occStats = undefined;
   occDrops.length = 0;
@@ -303,8 +457,10 @@ function loop(now: number): void {
 
   if (running && source) {
     void pump();
+    overlay.setPlayMode(!panel.visible);
+    gameChip.hidden = panel.visible || snapshot.state !== 'waiting';
     overlay.draw(now, lastFrameW || source.width, lastFrameH || source.height);
-    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
+    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), game: formatGame(snapshot), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
   }
   requestAnimationFrame(loop);
 }

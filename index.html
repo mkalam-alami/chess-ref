@@ -22,6 +22,45 @@
     #cameraPick { display: flex; gap: 8px; align-items: center; }
     #cameraPick select { font: inherit; padding: 8px; border-radius: 8px; background: #222; color: #eee; border: 1px solid #555; max-width: 70vw; }
     #notice { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 15; padding: 6px 12px; border-radius: 8px; background: rgba(0,0,0,.7); font-size: .9rem; }
+    #notice button { margin-left: 10px; padding: 4px 10px; font-size: .85rem; border-radius: 6px; }
+    #gameChip { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 12; padding: 6px 12px; border-radius: 16px; background: rgba(0,0,0,.6); border: 1px solid rgba(255,255,255,.25); font-size: .85rem; white-space: nowrap; pointer-events: none; }
+    /* Move sidebar: right column below the debug toggle (top-right, 8px + 36px) so neither covers the other. */
+    #moves { position: absolute; right: 0; top: 52px; bottom: 0; z-index: 14; width: 140px; box-sizing: border-box; display: flex; flex-direction: column; gap: 6px; padding: 6px; background: rgba(0,0,0,.45); border-radius: 10px 0 0 0; font-size: .85rem; }
+    #moves.collapsed { width: auto; bottom: auto; background: transparent; padding: 6px 8px; }
+    #moves.collapsed > :not(.mv-head), #moves.collapsed .mv-status { display: none !important; }
+    #moves button { padding: 6px 4px; font-size: .78rem; border-radius: 6px; background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25); }
+    #moves button:disabled { opacity: .4; }
+    .mv-head { display: flex; gap: 4px; align-items: flex-start; }
+    .mv-status { flex: 1; min-width: 0; font-weight: 600; line-height: 1.25; }
+    #moves .mv-toggle { flex: none; width: 28px; height: 28px; padding: 0; font-size: 1rem; border-radius: 50%; background: rgba(0,0,0,.5); }
+    #moves[data-state="desync"] .mv-status { color: #ffb4a8; }
+    .mv-desync { display: flex; gap: 4px; }
+    .mv-desync button { flex: 1; }
+    .mv-list { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; font: .85rem/1.5 ui-monospace, monospace; }
+    .mv-row { display: flex; gap: 4px; white-space: nowrap; }
+    .mv-no { width: 2.2em; flex: none; text-align: right; opacity: .6; }
+    .mv-ply { flex: 1; min-width: 0; padding: 0 2px; border-radius: 3px; overflow: hidden; text-overflow: ellipsis; }
+    .mv-ply.last { background: rgba(255,214,0,.35); }
+    .mv-ply.tentative { font-style: italic; opacity: .6; }
+    .mv-ply.promo { text-decoration: underline dotted; cursor: pointer; }
+    .mv-ply.flash { animation: mv-flash 1.5s ease-out; }
+    @keyframes mv-flash { from { background: rgba(255,82,82,.9); } to { background: transparent; } }
+    .mv-result { justify-content: center; font-weight: 600; }
+    .mv-actions { display: flex; flex-direction: column; gap: 4px; }
+    .mv-promo { position: absolute; left: 6px; right: 6px; z-index: 1; display: flex; gap: 4px; padding: 4px; border-radius: 6px; background: rgba(20,20,20,.95); }
+    .mv-promo button { flex: 1; }
+    .mv-pgn { position: absolute; left: 6px; right: 6px; bottom: 6px; height: 50%; box-sizing: border-box; font: .75rem ui-monospace, monospace; background: #111; color: #eee; border: 1px solid #555; border-radius: 6px; }
+    /* Portrait: a bottom strip instead of a column (the camera view keeps the width). */
+    @media (orientation: portrait) {
+      #moves { top: auto; left: 0; width: auto; height: 132px; border-radius: 10px 10px 0 0; }
+      #moves.collapsed { left: auto; height: auto; }
+      .mv-list { display: flex; flex-wrap: wrap; align-content: flex-start; column-gap: 10px; }
+      .mv-ply, .mv-no { flex: none; width: auto; }
+      .mv-actions { flex-direction: row; }
+      .mv-actions button { flex: 1; }
+      #notice { bottom: 144px; }
+      #loading { bottom: 144px; }
+    }
     [hidden] { display: none !important; }
   </style>
 </head>
@@ -31,6 +70,15 @@
     <button id="resetBoard" type="button" hidden>Reset board</button>
     <div id="loading" hidden>Loading OpenCV…</div>
     <div id="notice" role="status" hidden></div>
+    <div id="gameChip" hidden>Set up the starting position</div>
+    <aside id="moves" hidden aria-label="Moves">
+      <div class="mv-head"><span class="mv-status" aria-live="polite"></span><button class="mv-toggle" type="button"></button></div>
+      <div class="mv-desync" hidden><button class="mv-desync-undo" type="button">Undo</button><button class="mv-desync-continue" type="button">Continue</button></div>
+      <div class="mv-list"></div>
+      <div class="mv-promo" hidden><button type="button" data-piece="q">Q</button><button type="button" data-piece="r">R</button><button type="button" data-piece="b">B</button><button type="button" data-piece="n">N</button></div>
+      <div class="mv-actions"><button class="mv-copy" type="button">Copy PGN</button><button class="mv-undo" type="button">Undo</button><button class="mv-new" type="button">New game</button></div>
+      <textarea class="mv-pgn" readonly hidden aria-label="PGN"></textarea>
+    </aside>
     <div id="start">
       <h1>Chess Ref</h1>
       <button id="startBtn" type="button">Start camera</button>

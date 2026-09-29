@@ -1,4 +1,5 @@
 import type { CameraInfo } from '../camera';
+import type { GameSnapshot } from '../game/types';
 import { DOT_LOW_CONF } from '../overlay';
 import { DEBUG_VIEWS, type DebugView, type OccupancyStats, type Params } from '../worker/protocol';
 
@@ -58,6 +59,18 @@ export interface DebugStats {
   profile?: string;
   /** Pre-formatted occupancy lines (see formatOccupancy). */
   occupancy?: string;
+  /** Pre-formatted game lines (see formatGame). */
+  game?: string;
+}
+
+/** Game summary for the stats block: state, side to move and ply count, then the top-3 hypotheses with scores. */
+export function formatGame(s: Pick<GameSnapshot, 'state' | 'turn' | 'plies' | 'top'> | undefined): string {
+  if (!s) return 'game    -\n';
+  let out = `game    ${s.state}${s.state === 'waiting' ? '' : ` ${s.turn} ply ${s.plies.length}`}\n`;
+  s.top.slice(0, 3).forEach((h, k) => {
+    out += `${k === 0 ? '  top ' : '      '}${(h.line || '(anchor)').padEnd(12)}${Number.isFinite(h.score) ? h.score.toFixed(1) : String(h.score)}\n`;
+  });
+  return out;
 }
 
 /**
@@ -213,7 +226,8 @@ export class DebugPanel {
     const header =
       `render  ${s.fps.toFixed(0)} fps\ndetect  ${s.detectionsPerSec.toFixed(1)} /s\n` +
       `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n` +
-      (s.occupancy ?? '');
+      (s.occupancy ?? '') +
+      (s.game ?? '');
 
     // Build timing rows with fading for irrelevant phases
     const timingLines: string[] = [];
