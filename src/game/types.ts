@@ -33,6 +33,14 @@ export interface GameSnapshot {
   lastMove: { from: SquareIndex; to: SquareIndex } | null;
   /** Expected occupancy in chess square order (OCC_EMPTY / OCC_WHITE / OCC_BLACK), null while waiting. */
   grid: Uint8Array | null;
+  /**
+   * The change the tracker is leaning towards but has not committed yet (the current challenger, while it leads the
+   * incumbent), for optimistic display; null when the incumbent is best. `progress` (0..1) is how close it is to
+   * committing (max of lead/threshold and dwell/hold).
+   */
+  pending: PendingChange | null;
+  /** Timing of the last committed change (observation clock), for the debug latency timeline; null before any. */
+  lastTiming: ChangeTiming | null;
   /** Debug: best hypotheses (move line from the anchor, e.g. 'e4 e5', '' for the anchor itself) and scores. */
   top: Array<{ line: string; score: number }>;
 }
@@ -47,3 +55,22 @@ export type GameEvent =
   | { type: 'resynced' }
   /** A confident start position after moves: the previous game was archived and a new one started. */
   | { type: 'newGame'; previousPgn: string };
+
+export interface PendingChange {
+  kind: 'advance' | 'revise' | 'takeback';
+  /** Plies of the line the challenger would put in place of the tentative ones (from `fromPly` on). */
+  fromPly: number;
+  plies: PlyInfo[];
+  progress: number;
+}
+
+export interface ChangeTiming {
+  kind: 'advance' | 'revise' | 'takeback';
+  /** Time of the first stable frame after the last unstable one (hand gone and settled), or null if none preceded. */
+  stableAt: number | null;
+  /** Time of the last unstable frame before the commit (≈ hand leaving), or null. */
+  unstableEndAt: number | null;
+  /** When the committed challenger became (and stayed) the favourite. */
+  favouriteAt: number;
+  committedAt: number;
+}

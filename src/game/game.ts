@@ -295,6 +295,8 @@ export class GameTracker {
       pieces: waiting ? new Array(64).fill(null) : piecesOf(this.chess),
       lastMove: last ? { from: last.from, to: last.to } : null,
       grid: waiting ? null : gridOf(this.chess),
+      pending: null,
+      lastTiming: null,
       top: this.lattice && !waiting ? this.lattice.top(3).map((n) => ({ line: n.line(), score: n.eff })) : [],
     };
   }
