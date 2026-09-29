@@ -9,8 +9,13 @@ import { applyEdits, legalMoves, type MoveSpec } from './board';
 export interface EvidenceFrame {
   /** Copy of Observation.logLik (64×3, chess square order). */
   logLik: Float32Array;
-  /** Frame counter (stable and unstable frames) when it was observed; weight = decay^(tick - this). */
+  /** Frame counter (stable and unstable frames) when it was observed (replay-buffer eviction). */
   tick: number;
+  /**
+   * Decay clock when it was observed: +1 per stable frame, +log(unstableDecay)/log(decay) per unstable frame, so that
+   * weight = decay^(age now - this) matches the per-frame fading of the live scores.
+   */
+  age: number;
 }
 
 /** Weight of HNode.tie in eff: only decides between grids that the evidence can't tell apart. */
@@ -26,6 +31,8 @@ export interface LatticeConfig {
   beam: number;
   /** Leaky-sum factor per frame. */
   decay: number;
+  /** Fading of every score per unstable frame (hand, freeze, dropped frame). */
+  unstableDecay: number;
   /** Prior cost per ply of edit distance between a hypothesis and the committed window. */
   plyPenalty: number;
   /** Hysteresis bonus of the incumbent (the committed tip). */
@@ -48,6 +55,8 @@ export class HNode {
   children: HNode[] | null = null;
   /** Leaky sum of per-frame log-likelihood relative to the anchor. */
   score = 0;
+  /** This frame's own contribution to `score` (0 after an unstable frame): the evidence of a single frame. */
+  gain = 0;
   /** score - prior + incumbent bonus, refreshed every frame. */
   eff = 0;
   /** Last frame this node was in the beam (or on the committed path). */
@@ -118,14 +127,16 @@ export class Lattice {
   /** Moving piece of each committed window ply. */
   private readonly pathPieces: string[] = [];
   private weights: Float64Array = new Float64Array(0);
-  private weightsTick = -1;
+  private weightsAge = -1;
   private framesSeen: readonly EvidenceFrame[] = [];
+  /** Decay clock of the current frame (see EvidenceFrame.age). */
+  private age = 0;
 
   /**
    * @param path the committed window (UCI moves from the anchor); every prefix must be legal.
-   * @param frames evidence to replay into new nodes, with `tick` the current frame counter.
+   * @param frames evidence to replay into new nodes, with `tick` the current frame counter and `age` the decay clock.
    */
-  constructor(anchorFen: string, anchorGrid: Uint8Array, readonly path: readonly string[], readonly cfg: LatticeConfig, frames: readonly EvidenceFrame[], tick: number) {
+  constructor(anchorFen: string, anchorGrid: Uint8Array, readonly path: readonly string[], readonly cfg: LatticeConfig, frames: readonly EvidenceFrame[], tick: number, age: number) {
     this.anchorGrid = anchorGrid;
     for (let i = 0, fen = anchorFen; i < path.length; i++) {
       const spec = legalMoves(fen).find((m) => m.uci === path[i]);
@@ -136,7 +147,7 @@ export class Lattice {
     this.root = new HNode(null, null, 0, anchorFen, anchorGrid, new Int32Array(0), new Int32Array(0), '', '');
     this.classify(this.root);
     this.nodes.push(this.root);
-    this.setFrames(frames, tick);
+    this.setFrames(frames, age);
     let n = this.root;
     for (let d = 0; ; d++) {
       n.lastWanted = tick;
@@ -150,13 +161,14 @@ export class Lattice {
     this.refreshEff();
   }
 
-  /** Evidence used to initialise nodes created from now on (the tracker's replay buffer). */
-  setFrames(frames: readonly EvidenceFrame[], tick: number): void {
+  /** Evidence used to initialise nodes created from now on (the tracker's replay buffer), `age` the current decay clock. */
+  setFrames(frames: readonly EvidenceFrame[], age: number): void {
     this.framesSeen = frames;
-    if (tick !== this.weightsTick || this.weights.length !== frames.length) {
+    this.age = age;
+    if (age !== this.weightsAge || this.weights.length !== frames.length) {
       this.weights = new Float64Array(frames.length);
-      for (let i = 0; i < frames.length; i++) this.weights[i] = Math.pow(this.cfg.decay, tick - frames[i]!.tick);
-      this.weightsTick = tick;
+      for (let i = 0; i < frames.length; i++) this.weights[i] = Math.pow(this.cfg.decay, age - frames[i]!.age);
+      this.weightsAge = age;
     }
   }
 
@@ -168,16 +180,20 @@ export class Lattice {
       const n = nodes[k]!;
       const a = n.idxN;
       const b = n.idxA;
-      let s = n.score * lam;
-      for (let i = 0; i < a.length; i++) s += logLik[a[i]!]! - logLik[b[i]!]!;
-      n.score = s;
+      let g = 0;
+      for (let i = 0; i < a.length; i++) g += logLik[a[i]!]! - logLik[b[i]!]!;
+      n.gain = g;
+      n.score = n.score * lam + g;
     }
   }
 
-  /** One unstable frame: evidence only fades. */
+  /** One unstable frame: evidence only fades (by `unstableDecay`). */
   decayOnly(): void {
-    const lam = this.cfg.decay;
-    for (const n of this.nodes) n.score *= lam;
+    const u = this.cfg.unstableDecay;
+    for (const n of this.nodes) {
+      n.score *= u;
+      n.gain = 0;
+    }
   }
 
   refreshEff(): void {
@@ -246,9 +262,16 @@ export class Lattice {
     return { best, runnerUp };
   }
 
-  /** The `k` best nodes by eff (debug display). */
+  /** The `k` best nodes by eff, best first (debug display; one pass, no sort of the whole tree). */
   top(k: number): HNode[] {
-    return [...this.nodes].sort((a, b) => b.eff - a.eff).slice(0, k);
+    const out: HNode[] = [];
+    for (const n of this.nodes) {
+      if (out.length < k) out.push(n);
+      else if (k > 0 && n.eff > out[k - 1]!.eff) out[k - 1] = n;
+      else continue;
+      for (let i = out.length - 1; i > 0 && out[i]!.eff > out[i - 1]!.eff; i--) [out[i], out[i - 1]] = [out[i - 1]!, out[i]!];
+    }
+    return out;
   }
 
   private onPath(n: HNode): boolean {
@@ -263,7 +286,7 @@ export class Lattice {
   }
 
   private expand(n: HNode, tick: number): void {
-    this.setFrames(this.framesSeen, tick);
+    this.setFrames(this.framesSeen, this.age);
     const onPath = this.onPath(n);
     const pathMove = onPath && n.depth < this.path.length ? this.path[n.depth]! : null;
     const children: HNode[] = [];
@@ -289,7 +312,7 @@ export class Lattice {
       child.common = onPath && spec.uci === pathMove ? n.depth + 1 : n.common;
       child.tie = n.tie + (child.common < child.depth && n.depth < this.path.length && spec.piece !== this.pathPieces[n.depth] ? 1 : 0);
       this.classify(child);
-      child.score = this.replay(idxN, idxA);
+      this.replay(child);
       child.eff = child.score - this.cfg.plyPenalty * child.cost - TIE_WEIGHT * child.tie;
       child.lastWanted = tick;
       children.push(child);
@@ -298,16 +321,20 @@ export class Lattice {
     n.children = children;
   }
 
-  /** Score a node would have if it had been scored on every frame of the replay buffer. */
-  private replay(idxN: Int32Array, idxA: Int32Array): number {
+  /** Sets the score (and gain) a node would have if it had been scored on every frame of the replay buffer. */
+  private replay(n: HNode): void {
+    const { idxN, idxA } = n;
     let s = 0;
+    let g = 0;
     const frames = this.framesSeen;
     for (let f = 0; f < frames.length; f++) {
       const L = frames[f]!.logLik;
       let d = 0;
       for (let i = 0; i < idxN.length; i++) d += L[idxN[i]!]! - L[idxA[i]!]!;
       s += this.weights[f]! * d;
+      if (frames[f]!.age === this.age) g = d;
     }
-    return s;
+    n.score = s;
+    n.gain = g;
   }
 }
