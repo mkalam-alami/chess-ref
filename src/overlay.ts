@@ -1,6 +1,7 @@
 import { applyH, homographyFrom4, type Point } from './geom/homography';
 import { BOARD_CORNERS, signedArea } from './geom/cornerOrder';
 import { OCC_BLACK, OCC_WHITE } from './worker/protocol';
+import type { PieceCode } from './game/types';
 
 export interface CoverMap {
   scale: number;
@@ -169,6 +170,125 @@ export function drawDots(ctx: CanvasRenderingContext2D, dots: readonly OccDot[],
   ctx.restore();
 }
 
+/** Icon size relative to the projected cell size. */
+export const PIECE_SIZE = 0.9;
+/** Where the icon's bottom edge sits below the cell centre, in projected cell sizes (anchors it toward the base). */
+export const PIECE_BASE = 0.32;
+/** Icon opacity at full quad alpha (slightly translucent so the real board shows through). */
+export const PIECE_ALPHA = 0.85;
+export const LAST_MOVE_TINT = 'rgba(255, 214, 0, 0.38)';
+
+export interface PieceMark {
+  /** Chess square (a1 = 0). */
+  sq: number;
+  code: PieceCode;
+  /** Top-left corner and side of the screen-upright icon box. */
+  x: number;
+  y: number;
+  size: number;
+}
+
+export interface GameMarks {
+  pieces: PieceMark[];
+  /** Screen polygons of the last move's from / to cells. */
+  tint: Point[][];
+}
+
+/** Board cell (i, j) of a chess square under the orientation map (ResultMessage.orientation), or null if invalid. */
+function squareCell(orientation: ArrayLike<number>, sq: number): [number, number] | null {
+  const cell = orientation[sq];
+  if (cell === undefined || !(cell >= 0 && cell < 64)) return null;
+  return [cell % 8, Math.floor(cell / 8)];
+}
+
+/**
+ * Screen placement of the game's pieces on the quad `corners` (board (0,0), (8,0), (8,8), (0,8)): one screen-upright
+ * icon box per occupied square, sized by the projected cell size (as in occupancyDots) and anchored with its bottom
+ * edge slightly below the cell centre, plus the last move's cells as polygons. `pieces` is in chess square order and
+ * square sq lies on board cell orientation[sq]. Pieces are sorted far-to-near (by screen y) so nearer icons overlap
+ * farther ones. Returns empty marks for a degenerate quad or malformed arrays.
+ */
+export function gameMarks(
+  corners: readonly Point[],
+  orientation: ArrayLike<number>,
+  pieces: ReadonlyArray<PieceCode | null>,
+  lastMove: { from: number; to: number } | null = null,
+): GameMarks {
+  const out: GameMarks = { pieces: [], tint: [] };
+  if (corners.length !== 4 || orientation.length !== 64 || pieces.length !== 64) return out;
+  const h = homographyFrom4(BOARD_CORNERS, corners);
+  if (!h) return out;
+  const cellPoly = ([i, j]: [number, number]): Point[] => [applyH(h, [i, j]), applyH(h, [i + 1, j]), applyH(h, [i + 1, j + 1]), applyH(h, [i, j + 1])];
+  for (let sq = 0; sq < 64; sq++) {
+    const code = pieces[sq];
+    if (!code) continue;
+    const ij = squareCell(orientation, sq);
+    if (!ij) continue;
+    const cell = Math.sqrt(Math.abs(signedArea(cellPoly(ij))));
+    const [cx, cy] = applyH(h, [ij[0] + 0.5, ij[1] + 0.5]);
+    if (!Number.isFinite(cell) || !Number.isFinite(cx) || !Number.isFinite(cy) || cell <= 0) continue;
+    const size = cell * PIECE_SIZE;
+    out.pieces.push({ sq, code, x: cx - size / 2, y: cy + cell * PIECE_BASE - size, size });
+  }
+  out.pieces.sort((a, b) => a.y - b.y);
+  if (lastMove) {
+    for (const sq of [lastMove.from, lastMove.to]) {
+      const ij = squareCell(orientation, sq);
+      if (!ij) continue;
+      const poly = cellPoly(ij);
+      if (poly.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y))) out.tint.push(poly);
+    }
+  }
+  return out;
+}
+
+/** Icon source for a piece, or null to draw its glyph. */
+export type PieceImages = (code: PieceCode) => CanvasImageSource | null;
+
+const GLYPHS: Record<string, string> = { P: '\u265F', N: '\u265E', B: '\u265D', R: '\u265C', Q: '\u265B', K: '\u265A' };
+
+export function drawGameMarks(ctx: CanvasRenderingContext2D, marks: GameMarks, alpha: number, images: PieceImages): void {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = LAST_MOVE_TINT;
+  for (const poly of marks.tint) {
+    ctx.beginPath();
+    poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1])));
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.globalAlpha = alpha * PIECE_ALPHA;
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.shadowBlur = 3;
+  for (const m of marks.pieces) {
+    const img = images(m.code);
+    if (img) {
+      ctx.drawImage(img, m.x, m.y, m.size, m.size);
+      continue;
+    }
+    // Fallback until the icon is loaded (or when it is not vendored): a filled glyph with a contrasting outline.
+    ctx.font = `${Math.round(m.size * 0.9)}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    const g = GLYPHS[m.code[1]!] ?? '?';
+    const x = m.x + m.size / 2;
+    const y = m.y + m.size;
+    ctx.lineWidth = Math.max(1, m.size * 0.04);
+    ctx.strokeStyle = m.code[0] === 'w' ? '#000' : '#fff';
+    ctx.strokeText(g, x, y);
+    ctx.fillStyle = m.code[0] === 'w' ? '#fff' : '#000';
+    ctx.fillText(g, x, y);
+  }
+  ctx.restore();
+}
+
+/** What the overlay shows of the game in play mode: the engine position, or null before lock-in. */
+export interface OverlayGame {
+  pieces: ReadonlyArray<PieceCode | null>;
+  lastMove: { from: number; to: number } | null;
+}
+
 interface HeldQuad {
   points: Point[];
   frameW: number;
@@ -178,12 +298,20 @@ interface HeldQuad {
   grid: Uint8Array | null;
   /** Committed-class probability per cell (ResultMessage.occupancyProb), or null for full-confidence styling. */
   prob: Float32Array | null;
+  /** Chess square -> board cell (ResultMessage.orientation), or null while unknown. */
+  orientation: Uint8Array | null;
 }
 
-/** Fullscreen canvas above the video: draws the held quad and an optional debug image. */
+/**
+ * Fullscreen canvas above the video: draws the held quad and an optional debug image. In debug mode the quad carries
+ * the occupancy dots; in play mode it carries the game's pieces (once a game is playing and the orientation is known).
+ */
 export class Overlay {
   private ctx: CanvasRenderingContext2D;
   private quad: HeldQuad | null = null;
+  private playMode = false;
+  private game: OverlayGame | null = null;
+  private images: PieceImages = () => null;
   private debugImage: { image: ImageBitmap; alpha: number } | null = null;
   private viewW = 0;
   private viewH = 0;
@@ -216,8 +344,23 @@ export class Overlay {
     timeMs: number,
     grid: Uint8Array | null = null,
     prob: Float32Array | null = null,
+    orientation: Uint8Array | null = null,
   ): void {
-    this.quad = { points, frameW, frameH, time: timeMs, grid, prob };
+    this.quad = { points, frameW, frameH, time: timeMs, grid, prob, orientation };
+  }
+
+  /** Play mode (debug panel hidden): pieces instead of dots. */
+  setPlayMode(on: boolean): void {
+    this.playMode = on;
+  }
+
+  /** The game position to draw in play mode, or null (then only the quad is drawn). */
+  setGame(game: OverlayGame | null): void {
+    this.game = game;
+  }
+
+  setPieceImages(images: PieceImages): void {
+    this.images = images;
   }
 
   /** Drops the held quad and occupancy grid (e.g. when the source changes). */
@@ -254,6 +397,10 @@ export class Overlay {
     const m = coverMap(q.frameW, q.frameH, this.viewW, this.viewH);
     const screen = q.points.map((p) => frameToScreen(p, m));
     drawQuad(ctx, screen, alpha);
-    if (q.grid) drawDots(ctx, occupancyDots(screen, q.grid, q.prob), alpha);
+    if (!this.playMode) {
+      if (q.grid) drawDots(ctx, occupancyDots(screen, q.grid, q.prob), alpha);
+    } else if (this.game && q.orientation) {
+      drawGameMarks(ctx, gameMarks(screen, q.orientation, this.game.pieces, this.game.lastMove), alpha, this.images);
+    }
   }
 }
