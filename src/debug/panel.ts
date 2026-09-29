@@ -1,4 +1,4 @@
-import { DEBUG_VIEWS, type DebugView, type Params } from '../worker/protocol';
+import { DEBUG_VIEWS, type DebugView, type OccupancyStats, type Params } from '../worker/protocol';
 
 export const RESOLUTIONS = [480, 640, 800] as const;
 
@@ -54,6 +54,21 @@ export interface DebugStats {
   confidence: number;
   mode: string;
   profile?: string;
+  /** Pre-formatted occupancy lines (see formatOccupancy). */
+  occupancy?: string;
+}
+
+/**
+ * Occupancy summary for the stats block: bootstrap state, committed W/B/empty counts, low-confidence cells on the
+ * last frame, the fraction of frames whose occupancy was dropped over the recent window, and the freeze flag.
+ */
+export function formatOccupancy(s: OccupancyStats | undefined, dropRate: number | null): string {
+  if (!s) return 'occ     -\n';
+  const drop = dropRate === null ? '-' : `${Math.round(100 * dropRate)}%`;
+  return (
+    `occ     ${s.state} W${s.white} B${s.black} E${s.empty}\n` +
+    `        low ${s.lowCells}  drop ${drop}/2s${s.dropped ? ' (now)' : ''}${s.frozen ? '  FROZEN' : ''}\n`
+  );
 }
 
 const STYLE = `
@@ -68,7 +83,7 @@ const STYLE = `
 const TIMING_PHASES = [
   'decode', 'lab', 'clahe', 'gradient', 'canny', 'gradientScale',
   'lines', 'vanishing', 'grid', 'refit', 'refine', 'polish', 'refineVerify',
-  'verify', 'debug', 'trackFailed', 'total',
+  'verify', 'occupancy', 'debug', 'trackFailed', 'total',
 ] as const;
 
 export class DebugPanel {
@@ -153,11 +168,13 @@ export class DebugPanel {
     if (this.panel.hidden) return;
     const header =
       `render  ${s.fps.toFixed(0)} fps\ndetect  ${s.detectionsPerSec.toFixed(1)} /s\n` +
-      `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n`;
+      `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n` +
+      (s.occupancy ?? '');
 
     // Build timing rows with fading for irrelevant phases
     const timingLines: string[] = [];
-    for (const phase of TIMING_PHASES) {
+    const extra = Object.keys(s.timings).filter((k) => !(TIMING_PHASES as readonly string[]).includes(k));
+    for (const phase of [...TIMING_PHASES.slice(0, -1), ...extra, 'total']) {
       const value = s.timings[phase];
       const isFaded = value === undefined || value === 0;
       const className = isFaded ? ' class="dbg-timing-faded"' : '';

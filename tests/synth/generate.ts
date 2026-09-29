@@ -10,7 +10,7 @@ export interface SampleSpec {
   /** 'printed' = black/light-grey print inside a thin black coordinate ring and a red-brown wooden frame. */
   palette: 'wood' | 'vinyl' | 'printed';
   /** 'outer' = occluders concentrated in ranks 1-2 and 7-8, like a starting position. */
-  pieces: 'none' | 'some' | 'outer';
+  pieces: 'none' | 'some' | 'outer' | 'start';
 }
 
 export interface Sample {
@@ -22,6 +22,9 @@ export interface Sample {
   label: string;
   seed: number;
   meta: Record<string, number | string>;
+  /** Ground-truth occupancy per cell (0 empty, 1 light piece, 2 dark piece), cell (i, j) at j * 8 + i where cell
+   *  (i, j) spans [i, i+1] x [j, j+1] of the board whose corners are `corners` ((0,0), (8,0), (8,8), (0,8)). */
+  occupancy?: Uint8Array;
 }
 
 type RGB = [number, number, number];
@@ -144,13 +147,13 @@ function convexHull(pts: Point[]): Point[] {
   return lo.concat(up);
 }
 
-interface Camera {
+export interface Camera {
   project(x: number, y: number, z: number): [number, number, number];
   hBoard: Mat3;
   dist: number;
 }
 
-function makeCamera(az: number, el: number, roll: number, fpx: number, D: number, cx: number, cy: number): Camera {
+export function makeCamera(az: number, el: number, roll: number, fpx: number, D: number, cx: number, cy: number): Camera {
   const C: [number, number, number] = [D * Math.cos(el) * Math.cos(az), D * Math.cos(el) * Math.sin(az), D * Math.sin(el)];
   const f: [number, number, number] = [-Math.cos(el) * Math.cos(az), -Math.cos(el) * Math.sin(az), -Math.sin(el)];
   const r0: [number, number, number] = [-Math.sin(az), Math.cos(az), 0];
@@ -361,7 +364,51 @@ function renderBoard(rng: Rng, img: Float32Array, hb: Mat3, style: BoardStyle): 
   }
 }
 
-function drawPieces(rng: Rng, img: Float32Array, cam: Camera, count: number, outer = false): void {
+/** Starting position: light pieces on rows 0-1, dark on rows 6-7, with realistic heights and radii (cells). */
+function drawStart(rng: Rng, img: Float32Array, cam: Camera, gt: Uint8Array): void {
+  const back: Array<[number, number]> = [[1.05, 0.37], [1.25, 0.37], [1.4, 0.36], [1.55, 0.39], [1.7, 0.39], [1.4, 0.36], [1.25, 0.37], [1.05, 0.37]];
+  const chosen: Array<{ x: number; y: number; h: number; r: number; light: boolean; depth: number }> = [];
+  for (const j of [0, 1, 6, 7])
+    for (let i = 0; i < 8; i++) {
+      const pawn = j === 1 || j === 6;
+      const [h, r] = pawn ? [0.95, 0.32] : back[i]!;
+      const x = i - 3.5 + (rng() - 0.5) * 0.12;
+      const y = j - 3.5 + (rng() - 0.5) * 0.12;
+      gt[j * 8 + i] = j < 2 ? 1 : 2;
+      chosen.push({ x, y, h: h * (0.95 + rng() * 0.1), r, light: j < 2, depth: cam.project(x, y, 0)[2] });
+    }
+  chosen.sort((a, b) => b.depth - a.depth);
+  for (const p of chosen) drawPiece(rng, img, cam, p.x, p.y, p.r, p.h, p.r * 0.55, p.light);
+}
+
+function drawPiece(rng: Rng, img: Float32Array, cam: Camera, px: number, py: number, r: number, h: number, rt: number, isLight: boolean): void {
+  const body = isLight ? jitterColor(rng, hex('#e8e0c8'), 0.15) : jitterColor(rng, hex('#2a2622'), 0.4);
+  const n = 20;
+  const bottom: Point[] = [];
+  const top: Point[] = [];
+  const rim: Point[] = [];
+  for (let k = 0; k < n; k++) {
+    const a = (k / n) * Math.PI * 2;
+    const b = cam.project(px + r * Math.cos(a), py + r * Math.sin(a), 0);
+    const t = cam.project(px + rt * Math.cos(a), py + rt * Math.sin(a), h);
+    bottom.push([b[0], b[1]]);
+    top.push([t[0], t[1]]);
+    const m = cam.project(px + r * 0.8 * Math.cos(a), py + r * 0.8 * Math.sin(a), h * 0.3);
+    rim.push([m[0], m[1]]);
+  }
+  const hull = convexHull([...bottom, ...top, ...rim]);
+  const xs = hull.map((q) => q[0]);
+  const xmin = Math.min(...xs);
+  const span = Math.max(1, Math.max(...xs) - xmin);
+  const dir = rng() < 0.5 ? 1 : -1;
+  fillConvex(img, hull, body, (x) => {
+    const t = (x - xmin) / span;
+    return 0.8 + 0.4 * (dir > 0 ? t : 1 - t);
+  });
+  fillConvex(img, top, mix(body, isLight ? [255, 255, 255] : [90, 85, 80], 0.25));
+}
+
+function drawPieces(rng: Rng, img: Float32Array, cam: Camera, count: number, outer = false, gt?: Uint8Array): void {
   const squares = Array.from({ length: 64 }, (_, i) => i).filter((i) => !outer || [0, 1, 6, 7].includes(Math.floor(i / 8)));
   for (let i = squares.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
@@ -376,6 +423,7 @@ function drawPieces(rng: Rng, img: Float32Array, cam: Camera, count: number, out
   const lightPieces = rng() < 0.5;
   for (const p of chosen) {
     const isLight = outer ? p.y > 0 : rng() < (lightPieces ? 0.7 : 0.3);
+    if (gt) gt[Math.round(p.y + 3.5) * 8 + Math.round(p.x + 3.5)] = isLight ? 1 : 2;
     const body = isLight ? jitterColor(rng, hex('#e8e0c8'), 0.15) : jitterColor(rng, hex('#2a2622'), 0.4);
     const r = 0.27 + rng() * 0.13;
     const h = outer ? 0.8 + rng() * 1.3 : 0.8 + rng() * 1.1;
@@ -533,13 +581,20 @@ export function makeBoardSample(cv: CV, seed: number, spec: SampleSpec): Sample 
   const img = new Float32Array(W * H * 3);
   drawBackground(rng, img, spec.palette === 'printed' ? 'greywood' : 'clutter');
   renderBoard(rng, img, cam.hBoard, style);
-  const nPieces = spec.pieces === 'none' ? 0 : spec.pieces === 'outer' ? Math.floor(U(14, 33)) : Math.floor(U(8, 33));
-  meta.pieces = nPieces;
-  if (nPieces > 0) drawPieces(rng, img, cam, nPieces, spec.pieces === 'outer');
+  const occupancy = new Uint8Array(64);
+  if (spec.pieces === 'start') {
+    // Own RNG stream so the lighting and noise below match the 'none' sample of the same seed.
+    drawStart(mulberry32(seed * 131 + 5), img, cam, occupancy);
+    meta.pieces = 32;
+  } else {
+    const nPieces = spec.pieces === 'none' ? 0 : spec.pieces === 'outer' ? Math.floor(U(14, 33)) : Math.floor(U(8, 33));
+    meta.pieces = nPieces;
+    if (nPieces > 0) drawPieces(rng, img, cam, nPieces, spec.pieces === 'outer', occupancy);
+  }
   const rgba = degrade(cv, rng, img, meta);
   return {
     rgba, width: W, height: H, corners: corners as Sample['corners'],
-    label: `${spec.elev}-${spec.palette}-${spec.pieces}`, seed, meta,
+    label: `${spec.elev}-${spec.palette}-${spec.pieces}`, seed, meta, occupancy,
   };
 }
 

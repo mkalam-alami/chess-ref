@@ -1,4 +1,6 @@
-import type { Point } from './geom/homography';
+import { applyH, homographyFrom4, type Point } from './geom/homography';
+import { BOARD_CORNERS, signedArea } from './geom/cornerOrder';
+import { OCC_BLACK, OCC_WHITE } from './worker/protocol';
 
 export interface CoverMap {
   scale: number;
@@ -58,11 +60,74 @@ export function drawQuad(
   ctx.restore();
 }
 
+export const DOT_EMPTY = '#000000';
+export const DOT_WHITE = '#ffffff';
+export const DOT_BLACK = '#00c853';
+export const DOT_OUTLINE = 'rgba(0,0,0,0.85)';
+
+export interface OccDot {
+  x: number;
+  y: number;
+  r: number;
+  fill: string;
+  /** Whether the dot gets the thin dark outline (piece dots, so white shows on light squares). */
+  outline: boolean;
+}
+
+/**
+ * One dot per board cell for an occupancy grid (index j * 8 + i, see ResultMessage.occupancy), placed at the
+ * projected centre of cell (i, j) under the homography mapping board (0,0), (8,0), (8,8), (0,8) to `corners`.
+ * The radius scales with the projected cell size (sqrt of its area): small black dots for empty cells, larger
+ * white / green dots for white / black pieces. Returns [] for a degenerate quad or a grid of the wrong size.
+ */
+export function occupancyDots(corners: readonly Point[], grid: ArrayLike<number>): OccDot[] {
+  if (corners.length !== 4 || grid.length !== 64) return [];
+  const h = homographyFrom4(BOARD_CORNERS, corners);
+  if (!h) return [];
+  const dots: OccDot[] = [];
+  for (let j = 0; j < 8; j++) {
+    for (let i = 0; i < 8; i++) {
+      const v = grid[j * 8 + i]!;
+      const cell = [applyH(h, [i, j]), applyH(h, [i + 1, j]), applyH(h, [i + 1, j + 1]), applyH(h, [i, j + 1])];
+      const size = Math.sqrt(Math.abs(signedArea(cell)));
+      if (!Number.isFinite(size)) continue;
+      const [x, y] = applyH(h, [i + 0.5, j + 0.5]);
+      const piece = v === OCC_WHITE || v === OCC_BLACK;
+      dots.push({
+        x,
+        y,
+        r: Math.max(piece ? 2.5 : 1.5, size * (piece ? 0.24 : 0.09)),
+        fill: v === OCC_WHITE ? DOT_WHITE : v === OCC_BLACK ? DOT_BLACK : DOT_EMPTY,
+        outline: piece,
+      });
+    }
+  }
+  return dots;
+}
+
+export function drawDots(ctx: CanvasRenderingContext2D, dots: readonly OccDot[], alpha: number): void {
+  if (alpha <= 0 || dots.length === 0) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = DOT_OUTLINE;
+  for (const d of dots) {
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+    ctx.fillStyle = d.fill;
+    ctx.fill();
+    if (d.outline) ctx.stroke();
+  }
+  ctx.restore();
+}
+
 interface HeldQuad {
   points: Point[];
   frameW: number;
   frameH: number;
   time: number;
+  /** Occupancy grid shown with the quad (corners[k] <-> board corner k), or null. */
+  grid: Uint8Array | null;
 }
 
 /** Fullscreen canvas above the video: draws the held quad and an optional debug image. */
@@ -90,9 +155,12 @@ export class Overlay {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  /** Points are in the coordinates of a frame of size frameW x frameH. */
-  setQuad(points: Point[], frameW: number, frameH: number, timeMs: number): void {
-    this.quad = { points, frameW, frameH, time: timeMs };
+  /**
+   * Points are in the coordinates of a frame of size frameW x frameH; points[k] must be board corner k
+   * ((0,0), (8,0), (8,8), (0,8)) for the optional occupancy grid to line up.
+   */
+  setQuad(points: Point[], frameW: number, frameH: number, timeMs: number, grid: Uint8Array | null = null): void {
+    this.quad = { points, frameW, frameH, time: timeMs, grid };
   }
 
   /** Time since the last quad was set, or Infinity. */
@@ -122,6 +190,8 @@ export class Overlay {
     const alpha = quadAlpha(nowMs - q.time);
     if (alpha <= 0) return;
     const m = coverMap(q.frameW, q.frameH, this.viewW, this.viewH);
-    drawQuad(ctx, q.points.map((p) => frameToScreen(p, m)), alpha);
+    const screen = q.points.map((p) => frameToScreen(p, m));
+    drawQuad(ctx, screen, alpha);
+    if (q.grid) drawDots(ctx, occupancyDots(screen, q.grid), alpha);
   }
 }

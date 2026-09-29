@@ -10,6 +10,7 @@ import { TrackPreprocessor } from './trackPre';
 import { CornerRefiner, refineOptions, REFINE_PARAMS, type RefineResult } from './refine';
 import type { BoardProfile } from './profile';
 import { PROFILE_PARAMS } from './profile';
+import { OCCUPANCY_PARAMS } from './occupancy';
 import { boardCorners, verifyBoard, verifyOptions, VERIFY_PARAMS, type Lab3, type VerifyOptions, type VerifyResult } from './verify';
 
 type Mat = InstanceType<CV['Mat']>;
@@ -55,6 +56,7 @@ export const ALL_PARAMS: readonly ParamSpec[] = [
   ...REFINE_PARAMS,
   ...PROFILE_PARAMS,
   ...TRACK_PARAMS,
+  ...OCCUPANCY_PARAMS,
 ];
 
 export interface CandidateInfo {

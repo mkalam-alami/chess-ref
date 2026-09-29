@@ -1,12 +1,11 @@
 import { CameraError, FrameGrabber, loadFileSource, startCamera, type FrameSource } from './camera';
-import { DebugPanel, getParams, registerParam } from './debug/panel';
-import { repairQuad, stabiliseCorners } from './geom/cornerOrder';
-import type { Quad } from './geom/homography';
+import { DebugPanel, formatOccupancy, getParams, registerParam } from './debug/panel';
+import { isSimpleQuad } from './geom/cornerOrder';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS } from './overlay';
 import { ALL_PARAMS } from './vision/detector';
 import { describeProfile } from './vision/profile';
-import type { FrameMessage, ResultMessage, WorkerToMain } from './worker/protocol';
+import type { FrameMessage, OccupancyStats, ResultMessage, WorkerToMain } from './worker/protocol';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const app = $('app');
@@ -51,7 +50,13 @@ resetBoardBtn.addEventListener('click', () => {
 });
 const modeCounts = { full: 0, tracking: 0 };
 
-const tracker = { prev: null as Quad | null, filter: new PointsFilter(4, 1.0, 0.02) };
+// The worker keeps corners[k] = board corner k across frames (orientation is stabilised in TrackingSession), so
+// the quad is only smoothed here, never reordered: reordering would misalign the occupancy grid.
+const tracker = { filter: new PointsFilter(4, 1.0, 0.02), grid: null as Uint8Array | null };
+let occStats: OccupancyStats | undefined;
+/** (time, dropped) per result carrying occupancy stats, over the last ~2 s. */
+const occDrops: Array<[number, boolean]> = [];
+const OCC_DROP_WINDOW_MS = 2000;
 const detTimes: number[] = [];
 let fps = 0;
 let frames = 0;
@@ -92,6 +97,10 @@ function handleResult(r: ResultMessage): void {
   modeCounts[r.mode]++;
   lastFrameW = r.width;
   lastFrameH = r.height;
+  if (r.occupancyStats) {
+    occStats = r.occupancyStats;
+    occDrops.push([now, r.occupancyStats.dropped]);
+  }
   // A debug image is only ever shown while the panel is open and a real view is selected; otherwise it would
   // be a lagging copy of the video drawn over the live stream (ghosting).
   if (r.debugImage && panel.visible && panel.view !== 'none') overlay.setDebugImage(r.debugImage);
@@ -102,17 +111,21 @@ function handleResult(r: ResultMessage): void {
   if (r.corners) {
     // Reset smoothing after the quad has fully faded so stale state does not drag the new one.
     if (overlay.msSinceQuad(now) > HOLD_MS + FADE_MS) {
-      tracker.prev = null;
       tracker.filter.reset();
+      tracker.grid = null;
     }
-    // Never draw a bow-tie: reorder it, or drop the result (the previous quad is held / fades).
-    const simple = repairQuad(r.corners);
-    if (simple) {
-      const ordered = tracker.prev ? stabiliseCorners(tracker.prev, simple) : simple;
-      tracker.prev = ordered;
-      overlay.setQuad(tracker.filter.filter(ordered, now / 1000), r.width, r.height, now);
+    // Never draw a bow-tie: drop the result (the previous quad and grid are held / fade).
+    if (isSimpleQuad(r.corners)) {
+      // A null occupancy (dropped frame) keeps showing the last committed grid.
+      if (r.occupancy) tracker.grid = r.occupancy;
+      overlay.setQuad(tracker.filter.filter(r.corners, now / 1000), r.width, r.height, now, tracker.grid);
     }
   }
+}
+
+function occupancyText(): string {
+  const rate = occDrops.length ? occDrops.filter(([, d]) => d).length / occDrops.length : null;
+  return formatOccupancy(occStats, rate);
 }
 
 function showError(text: string): void {
@@ -159,6 +172,8 @@ async function begin(open: () => Promise<FrameSource>, fullscreen: boolean): Pro
   overlay.setDebugImage(null);
   worker.postMessage({ type: 'reset' });
   modeCounts.full = modeCounts.tracking = 0;
+  occStats = undefined;
+  occDrops.length = 0;
   updateLoading();
   setStatus('running');
 }
@@ -194,11 +209,12 @@ function loop(now: number): void {
     fpsStart = now;
   }
   while (detTimes.length && now - detTimes[0]! > 1000) detTimes.shift();
+  while (occDrops.length && now - occDrops[0]![0] > OCC_DROP_WINDOW_MS) occDrops.shift();
 
   if (running && source) {
     void pump();
     overlay.draw(now, lastFrameW || source.width, lastFrameH || source.height);
-    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
+    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, occupancy: occupancyText(), mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
   }
   requestAnimationFrame(loop);
 }

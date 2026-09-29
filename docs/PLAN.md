@@ -136,6 +136,7 @@ Dependencies: `vite`, `typescript`, `@techstark/opencv-js` (imported inside the 
    - **Unlock:** the profile is dropped automatically after a long loss of the board (e.g. more than 5 s with no detection), so a different board can be picked up.
    - **UI:** a single "Reset board" button returns to auto mode. There is no manual picker. The debug panel shows the locked profile.
    - **Goal:** performance first. Measure full-detection time before and after on the real photos and the synthetic set. Accuracy must not regress; check it on the real photos (printed B&W is the only real profile available) and on the synthetic vinyl and wood sets.
+8. **Square occupancy.** Classify each of the 64 squares as empty / white piece / black piece, with a camera-aware sampling footprint, per-cell hysteresis and a stable board orientation in the worker; the overlay draws one dot per square. See [PLAN-occupancy.md](PLAN-occupancy.md).
 
 ## Verification
 - **Unit tests (Vitest)** for the pure geometry: VP estimation, rectification, comb fitting, corner-order stabilisation. Test inputs are synthetic line sets.

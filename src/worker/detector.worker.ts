@@ -4,8 +4,10 @@ import type { CV } from '../vision/preprocess';
 import { Detector } from '../vision/detector';
 import { drawLines, drawVerify, rectifiedView } from '../vision/debugViews';
 import { ProfileLock } from '../vision/profile';
+import { drawOccupancy, OCCUPANCY_PARAMS, OccupancyTracker } from '../vision/occupancy';
+import { param } from '../vision/preprocess';
 import { TrackingSession } from './tracker';
-import type { DebugView, FrameMessage, MainToWorker, ResultMessage, WorkerToMain } from './protocol';
+import type { DebugView, FrameMessage, MainToWorker, OccupancyStats, ResultMessage, WorkerToMain } from './protocol';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -58,6 +60,8 @@ interface State {
 
 // --- board profile lock (agent B) ---
 const profileLock = new ProfileLock();
+// --- square occupancy (milestone 8): models and temporal filter live next to the profile lock ---
+const occupancy = new OccupancyTracker();
 let state: State | null = null;
 let canvas: OffscreenCanvas | null = null;
 
@@ -102,11 +106,30 @@ async function process(msg: FrameMessage): Promise<void> {
   Object.assign(timings, det.timings);
   const pre = s.detector.lastPre!;
 
+  // Occupancy samples the raw frame (not the CLAHE / L-only preprocessor output).
+  t = performance.now();
+  let grid: Uint8Array | null = null;
+  let occStats: OccupancyStats | undefined;
+  if (param(msg.params, OCCUPANCY_PARAMS, 'occupancy') > 0) {
+    if (det.hb) {
+      const occ = occupancy.update(img, det.hb, msg.params, performance.now());
+      grid = occ.grid;
+      occStats = occ.stats;
+    } else occStats = occupancy.noBoard(performance.now());
+  }
+  timings.occupancy = performance.now() - t;
+
   t = performance.now();
   let debugImage: ImageBitmap | undefined;
   if (view === 'gradient' || view === 'edges') {
     cv.cvtColor(view === 'gradient' ? pre.gradient : pre.edges, s.rgbaOut, cv.COLOR_GRAY2RGBA);
     debugImage = await toBitmap(new Uint8ClampedArray(s.rgbaOut.data) as Uint8ClampedArray<ArrayBuffer>, width, height);
+  } else if (view === 'occupancy') {
+    const c = new OffscreenCanvas(width, height);
+    const ctx = c.getContext('2d')!;
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), width, height), 0, 0);
+    if (det.hb && occupancy.debug) drawOccupancy(ctx, occupancy.debug);
+    debugImage = await createImageBitmap(c);
   } else if (wantDebug && det.debug) {
     const c = new OffscreenCanvas(width, height);
     const ctx = c.getContext('2d')!;
@@ -151,6 +174,8 @@ async function process(msg: FrameMessage): Promise<void> {
     timings,
     profile,
     debugImage,
+    occupancy: grid,
+    occupancyStats: occStats,
   };
   post(result, debugImage ? [debugImage] : []);
 }
@@ -161,10 +186,12 @@ scope.onmessage = (ev: MessageEvent<MainToWorker>) => {
   const msg = ev.data;
   if (msg.type === 'reset') {
     state?.session.reset();
+    occupancy.reset();
     return;
   }
   if (msg.type === 'resetProfile') {
     profileLock.reset();
+    occupancy.reset();
     return;
   }
   if (msg.type !== 'frame' || !state) return;
