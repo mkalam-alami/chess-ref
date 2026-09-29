@@ -62,7 +62,14 @@ const STYLE = `
 .dbg-panel label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0}
 .dbg-panel select,.dbg-panel input[type=range]{flex:1;min-width:0}
 .dbg-panel pre{margin:6px 0;white-space:pre-wrap}
+.dbg-timing-faded{opacity:0.35;color:#999}
 `;
+
+const TIMING_PHASES = [
+  'decode', 'lab', 'clahe', 'gradient', 'canny', 'gradientScale',
+  'lines', 'vanishing', 'grid', 'refit', 'refine', 'polish', 'refineVerify',
+  'verify', 'debug', 'trackFailed', 'total',
+] as const;
 
 export class DebugPanel {
   readonly toggleButton: HTMLButtonElement;
@@ -144,12 +151,21 @@ export class DebugPanel {
 
   update(s: DebugStats): void {
     if (this.panel.hidden) return;
-    const timings = Object.entries(s.timings)
-      .map(([k, v]) => `  ${k.padEnd(14)}${v.toFixed(1)} ms`)
-      .join('\n');
-    this.stats.textContent =
+    const header =
       `render  ${s.fps.toFixed(0)} fps\ndetect  ${s.detectionsPerSec.toFixed(1)} /s\n` +
-      `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n${timings}`;
+      `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n`;
+
+    // Build timing rows with fading for irrelevant phases
+    const timingLines: string[] = [];
+    for (const phase of TIMING_PHASES) {
+      const value = s.timings[phase];
+      const isFaded = value === undefined || value === 0;
+      const className = isFaded ? ' class="dbg-timing-faded"' : '';
+      const val = value ?? 0;
+      timingLines.push(`<span${className}>  ${phase.padEnd(14)}${val.toFixed(1)} ms</span>`);
+    }
+
+    this.stats.innerHTML = header + timingLines.join('\n');
   }
 
   private select(
