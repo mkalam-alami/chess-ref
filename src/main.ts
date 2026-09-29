@@ -1,5 +1,16 @@
-import { CameraError, FrameGrabber, loadFileSource, startCamera, type FrameSource } from './camera';
-import { DebugPanel, formatOccupancy, getParams, registerParam } from './debug/panel';
+import {
+  CameraError,
+  FrameGrabber,
+  listCameras,
+  loadCameraId,
+  loadFileSource,
+  resolveCameraId,
+  saveCameraId,
+  startCamera,
+  type CameraInfo,
+  type FrameSource,
+} from './camera';
+import { DebugPanel, fillCameraSelect, formatOccupancy, getParams, registerParam } from './debug/panel';
 import { isSimpleQuad } from './geom/cornerOrder';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS } from './overlay';
@@ -143,9 +154,19 @@ function showError(text: string): void {
   setStatus('error');
 }
 
+let notices = 0;
+function showNotice(text: string, ms = 4000): void {
+  const n = $('notice');
+  n.textContent = text;
+  n.hidden = false;
+  const k = ++notices;
+  setTimeout(() => k === notices && (n.hidden = true), ms);
+}
+
 function stopSource(): void {
   source?.stop();
   source = null;
+  sourceKind = 'none';
 }
 
 async function enterFullscreen(): Promise<void> {
@@ -176,6 +197,10 @@ async function begin(open: () => Promise<FrameSource>, fullscreen: boolean): Pro
   startScreen.hidden = true;
   running = true;
   overlay.setDebugImage(null);
+  overlay.clearQuad();
+  tracker.filter.reset();
+  tracker.grid = null;
+  tracker.prob = null;
   worker.postMessage({ type: 'reset' });
   modeCounts.full = modeCounts.tracking = 0;
   occStats = undefined;
@@ -184,10 +209,69 @@ async function begin(open: () => Promise<FrameSource>, fullscreen: boolean): Pro
   setStatus('running');
 }
 
-$('startBtn').addEventListener('click', () => void begin(startCamera, true));
+// Camera choice. `cameras` is empty until the browser exposes device ids (after the first permission grant).
+let cameras: CameraInfo[] = [];
+let activeCameraId: string | null = null;
+let sourceKind: 'none' | 'camera' | 'file' = 'none';
+let switching = false;
+const cameraPick = $('cameraPick');
+const cameraSelect = $<HTMLSelectElement>('cameraSelect');
+
+function renderCameraPickers(): void {
+  const startId = activeCameraId ?? resolveCameraId(loadCameraId(), cameras);
+  fillCameraSelect(cameraSelect, cameras, startId);
+  // Nothing chosen yet: say so rather than implying the first listed camera is the one that will open.
+  if (!startId || !cameras.some((c) => c.deviceId === startId)) cameraSelect.prepend(new Option('Default (rear)', '', true, true));
+  cameraPick.hidden = cameras.length < 2;
+  panel.setCameras(cameras, activeCameraId, sourceKind === 'camera');
+  app.dataset.cameras = String(cameras.length);
+}
+
+async function refreshCameras(): Promise<void> {
+  cameras = await listCameras();
+  // Drop a stored id that no longer exists (ids can change, e.g. after clearing site data).
+  const stored = loadCameraId();
+  if (stored && cameras.length > 0 && resolveCameraId(stored, cameras) === null) saveCameraId(null);
+  renderCameraPickers();
+}
+
+/** Starts the camera `requested` (stored/default when undefined); `explicit` when the user just picked it. */
+async function startCameraSource(requested: string | null | undefined, explicit: boolean, fullscreen: boolean): Promise<void> {
+  const id = requested === undefined ? resolveCameraId(loadCameraId(), cameras) : requested;
+  await begin(async () => {
+    const cam = await startCamera(id);
+    activeCameraId = cam.deviceId;
+    sourceKind = 'camera';
+    if (cam.fellBack) {
+      saveCameraId(null);
+      if (explicit) showNotice('That camera could not be opened; using the default camera.');
+    } else if (explicit) {
+      saveCameraId(cam.deviceId ?? id);
+    }
+    return cam;
+  }, fullscreen);
+  await refreshCameras();
+}
+
+$('startBtn').addEventListener('click', () => void startCameraSource(undefined, false, true));
+// On the start screen the choice only takes effect when Start is tapped.
+cameraSelect.addEventListener('change', () => saveCameraId(cameraSelect.value || null));
+panel.onCameraChange((id) => {
+  if (switching || sourceKind !== 'camera' || id === activeCameraId) return;
+  switching = true;
+  void startCameraSource(id, true, false).finally(() => (switching = false));
+});
+navigator.mediaDevices?.addEventListener?.('devicechange', () => void refreshCameras());
+void refreshCameras();
 $<HTMLInputElement>('fileInput').addEventListener('change', (ev) => {
   const file = (ev.target as HTMLInputElement).files?.[0];
-  if (file) void begin(() => loadFileSource(file), false);
+  if (!file) return;
+  void begin(async () => {
+    const src = await loadFileSource(file);
+    sourceKind = 'file';
+    activeCameraId = null;
+    return src;
+  }, false).then(renderCameraPickers);
 });
 
 async function pump(): Promise<void> {

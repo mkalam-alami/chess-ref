@@ -17,6 +17,11 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   await page.waitForTimeout(1500);
   await expect(page.locator('#overlay')).toHaveAttribute('data-debug-image', 'off');
 
+  // The fake camera is a single device: no camera picker on the start screen or in the debug panel.
+  await expect(app).toHaveAttribute('data-cameras', '1');
+  await expect(page.locator('#cameraPick')).toBeHidden();
+  await expect(page.locator('.dbg-camera')).toBeHidden();
+
   // No board profile is locked without a board in view, so the reset button stays hidden.
   await expect(page.locator('#resetBoard')).toBeHidden();
 

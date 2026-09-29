@@ -220,6 +220,11 @@ export class Overlay {
     this.quad = { points, frameW, frameH, time: timeMs, grid, prob };
   }
 
+  /** Drops the held quad and occupancy grid (e.g. when the source changes). */
+  clearQuad(): void {
+    this.quad = null;
+  }
+
   /** Time since the last quad was set, or Infinity. */
   msSinceQuad(nowMs: number): number {
     return this.quad ? nowMs - this.quad.time : Infinity;

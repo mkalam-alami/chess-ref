@@ -1,3 +1,4 @@
+import type { CameraInfo } from '../camera';
 import { DOT_LOW_CONF } from '../overlay';
 import { DEBUG_VIEWS, type DebugView, type OccupancyStats, type Params } from '../worker/protocol';
 
@@ -87,6 +88,16 @@ export function formatOccupancy(
   );
 }
 
+/** Fills a camera <select>, marking and selecting the active camera (first one if unknown). */
+export function fillCameraSelect(sel: HTMLSelectElement, cameras: readonly CameraInfo[], activeId: string | null): void {
+  sel.replaceChildren(
+    ...cameras.map((c) => {
+      const active = c.deviceId === activeId;
+      return new Option(active ? `\u25CF ${c.label}` : c.label, c.deviceId, false, active);
+    }),
+  );
+}
+
 const STYLE = `
 .dbg-toggle{position:absolute;top:8px;right:8px;z-index:20;width:36px;height:36px;padding:0;border-radius:50%;background:rgba(0,0,0,.5);color:#fff;font-size:16px;border:1px solid rgba(255,255,255,.4)}
 .dbg-panel{position:absolute;top:52px;right:8px;z-index:20;max-height:calc(100% - 64px);width:min(280px,calc(100% - 16px));overflow:auto;box-sizing:border-box;padding:10px;border-radius:10px;background:rgba(0,0,0,.72);color:#eee;font:12px/1.4 ui-monospace,monospace}
@@ -111,6 +122,9 @@ export class DebugPanel {
   private _resolution = 640;
   private resolutionListeners: Array<(r: number) => void> = [];
   private viewListeners: Array<(v: DebugView) => void> = [];
+  private cameraRow: HTMLLabelElement;
+  private cameraSel: HTMLSelectElement;
+  private cameraListeners: Array<(id: string) => void> = [];
 
   constructor(parent: HTMLElement, reg: ParamRegistry = registry) {
     const style = document.createElement('style');
@@ -139,8 +153,12 @@ export class DebugPanel {
       this._resolution = Number(v);
       this.resolutionListeners.forEach((l) => l(this._resolution));
     });
+    this.cameraRow = this.select('Camera', [], '', (id) => this.cameraListeners.forEach((l) => l(id)));
+    this.cameraRow.hidden = true;
+    this.cameraRow.classList.add('dbg-camera');
+    this.cameraSel = this.cameraRow.querySelector('select')!;
     this.sliders = document.createElement('div');
-    this.panel.append(viewSel, resSel, this.sliders);
+    this.panel.append(viewSel, resSel, this.cameraRow, this.sliders);
 
     reg.all().forEach((e) => this.addSlider(reg, e));
     reg.onRegister((e) => this.addSlider(reg, e));
@@ -178,6 +196,16 @@ export class DebugPanel {
 
   onViewChange(fn: (v: DebugView) => void): void {
     this.viewListeners.push(fn);
+  }
+
+  onCameraChange(fn: (deviceId: string) => void): void {
+    this.cameraListeners.push(fn);
+  }
+
+  /** Shows the camera picker when `show` and there is more than one camera. */
+  setCameras(cameras: readonly CameraInfo[], activeId: string | null, show: boolean): void {
+    fillCameraSelect(this.cameraSel, cameras, activeId);
+    this.cameraRow.hidden = !show || cameras.length < 2;
   }
 
   update(s: DebugStats): void {
