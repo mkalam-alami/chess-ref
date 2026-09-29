@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { mul3 } from '../src/geom/homography';
 import { Detector } from '../src/vision/detector';
 import type { CV } from '../src/vision/preprocess';
-import { cameraFromHomography, cellFootprints, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
+import { cameraFromHomography, cellFootprints, OCCUPANCY_PARAMS, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
 import { realCases } from './synth/bench';
 import { alignGt, GAME } from './synth/occBench';
@@ -173,6 +173,13 @@ describe('occupancy class log-likelihoods', () => {
     let n = 0;
     let top = 0;
     let pSum = 0;
+    // Low-visibility cells (vis < 0.3): vis is not exposed, so a twin tracker with a linear visibility weight (same
+    // state: logLik does not feed back) recovers it from the ratio of the logit spreads, vis^(1 - gamma).
+    const gamma = OCCUPANCY_PARAMS.find((p) => p.name === 'occLikVisGamma')!.default;
+    const spread = (l: Float32Array) => Math.max(l[0]!, l[1]!, l[2]!) - Math.min(l[0]!, l[1]!, l[2]!);
+    let nLow = 0;
+    let topLow = 0;
+    let pLow = 0;
     let seed = 7100;
     for (const elev of ['overhead', 'oblique'] as const)
       for (const palette of ['wood', 'vinyl', 'printed'] as const)
@@ -183,15 +190,25 @@ describe('occupancy class log-likelihoods', () => {
           const r = det.detect(f0 as unknown as ImageData, {});
           if (!r.hb || !s0.corners || !alignGt(s0.occupancy!, s0.corners, r.hb)) continue;
           const tr = new OccupancyTracker();
+          const twin = new OccupancyTracker();
+          const lin = { occLikVisGamma: 1 };
           let out = tr.update(f0, r.hb, {}, 0);
+          let outLin = twin.update(f0, r.hb, lin, 0);
           expect(out.logLik.length).toBe(192);
           let t = 0;
-          for (let i = 1; i < 5; i++) out = tr.update(f0, r.hb, {}, (t += 100));
+          for (let i = 1; i < 5; i++) {
+            out = tr.update(f0, r.hb, {}, (t += 100));
+            outLin = twin.update(f0, r.hb, lin, t);
+          }
           if (out.stats.state !== 'calibrated') continue;
           for (let m = 0; m <= 3; m++) {
             const s = makeBoardSample(cv, sd, { elev, palette, pieces: 'start' }, GAME.slice(0, m));
             const gt = alignGt(s.occupancy!, s.corners!, r.hb)!;
-            for (let i = 0; i < 4; i++) out = tr.update({ data: s.rgba, width: s.width, height: s.height }, r.hb, {}, (t += 100));
+            const fr = { data: s.rgba, width: s.width, height: s.height };
+            for (let i = 0; i < 4; i++) {
+              out = tr.update(fr, r.hb, {}, (t += 100));
+              outLin = twin.update(fr, r.hb, lin, t);
+            }
             for (let c = 0; c < 64; c++) {
               const l = out.logLik.subarray(c * 3, c * 3 + 3);
               expect(Math.abs(Math.exp(l[0]!) + Math.exp(l[1]!) + Math.exp(l[2]!) - 1)).toBeLessThan(1e-4);
@@ -200,13 +217,26 @@ describe('occupancy class log-likelihoods', () => {
               n++;
               pSum += Math.exp(l[arg]!);
               if (arg === gt[c]) top++;
+              const sg = spread(l);
+              const vis = sg > 1e-6 ? (spread(outLin.logLik.subarray(c * 3, c * 3 + 3)) / sg) ** (1 / (1 - gamma)) : 0;
+              if (vis < 0.3) {
+                nLow++;
+                pLow += Math.exp(l[arg]!);
+                if (arg === gt[c]) topLow++;
+              }
             }
           }
         }
-    console.log(`logLik: n=${n} top-1 ${((top / n) * 100).toFixed(1)}% mean predicted ${((pSum / n) * 100).toFixed(1)}%`);
+    const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+    console.log(
+      `logLik: n=${n} top-1 ${pct(top / n)} mean predicted ${pct(pSum / n)}; vis<0.3: n=${nLow} top-1 ${pct(topLow / nLow)} mean predicted ${pct(pLow / nLow)}`,
+    );
     expect(n).toBeGreaterThanOrEqual(64 * 4 * 6);
     expect(top / n).toBeGreaterThanOrEqual(0.9);
-    expect(Math.abs(pSum / n - top / n)).toBeLessThan(0.1);
+    expect(Math.abs(pSum / n - top / n)).toBeLessThan(0.05);
+    // Partly hidden cells are mostly right: no longer grossly under-confident (was ~48% predicted vs ~83% right).
+    expect(nLow).toBeGreaterThanOrEqual(30);
+    expect(topLow / nLow - pLow / nLow).toBeLessThan(0.2);
   }, 180_000);
 });
 

@@ -39,6 +39,9 @@ export const OCCUPANCY_PARAMS: readonly ParamSpec[] = [
   /** Temperature of the per-cell class log-likelihoods (the five features are correlated, so their summed NLL is
    *  over-confident by about this factor). */
   { name: 'occLikTemp', min: 1, max: 10, step: 0.25, default: 3 },
+  /** Exponent on the visible fraction in the log-likelihood evidence weight: partly hidden cells are still mostly
+   *  right, so a linear weight left them badly under-confident (vis 0 stays uniform). */
+  { name: 'occLikVisGamma', min: 0.1, max: 1, step: 0.05, default: 0.25 },
   /** EMA rate of the model updates from confident cells. */
   { name: 'occLearnRate', min: 0, max: 0.2, step: 0.005, default: 0.02 },
 ];
@@ -738,8 +741,8 @@ export interface OccupancyResult {
   conf: Float32Array;
   /**
    * Per-cell class log-probabilities, cell c's (empty, white, black) at c * 3 + (0, 1, 2), normalised per cell
-   * (logsumexp = 0). Hidden / low-visibility cells and outliers are flattened towards uniform (log 1/3) in proportion
-   * to the evidence lost. All uniform before calibration and on frames without a camera. Intended for scoring
+   * (logsumexp = 0). Hidden / low-visibility cells and outliers are flattened towards uniform (log 1/3) by the evidence
+   * lost (weight vis^occLikVisGamma, exactly uniform at vis 0). All uniform before calibration and on frames without a camera. Intended for scoring
    * candidate (legal) positions: sum logLik[c * 3 + class(c)] over the cells.
    */
   logLik: Float32Array;
@@ -866,6 +869,7 @@ export class OccupancyTracker {
     const outlier = param(params, OCCUPANCY_PARAMS, 'occOutlier');
     const scale = param(params, OCCUPANCY_PARAMS, 'occMarginScale');
     const temp = param(params, OCCUPANCY_PARAMS, 'occLikTemp');
+    const visGamma = param(params, OCCUPANCY_PARAMS, 'occLikVisGamma');
     const d3 = [0, 0, 0];
     let sum = 0;
     for (let c = 0; c < 64; c++) {
@@ -886,8 +890,8 @@ export class OccupancyTracker {
         } else if (d < second) second = d;
       }
       raw[c] = arg;
-      // Evidence weight: visible fraction, reduced for outliers (hand, glare) that match no model.
-      const ew = Math.max(0, Math.min(1, feats.vis[c]!)) * (near > outlier ? OUTLIER_EVIDENCE : 1);
+      // Evidence weight: visible fraction (to the power occLikVisGamma), reduced for outliers (hand, glare) that match no model.
+      const ew = Math.max(0, Math.min(1, feats.vis[c]!)) ** visGamma * (near > outlier ? OUTLIER_EVIDENCE : 1);
       let lse = -Infinity;
       for (let cls = 0; cls < 3; cls++) {
         const l = (-(d3[cls]! - best) / temp) * ew;
