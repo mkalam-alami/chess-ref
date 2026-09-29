@@ -1,8 +1,9 @@
 // Entry of `npm run bench` (see vitest.bench.config.ts). Environment: BENCH_N (samples per category), BENCH_SEED,
 // BENCH_FILTER (substring of the category label), BENCH_DUMP (max failure PNGs per run),
 // BENCH_OCC=0 skips occupancy, BENCH_OCC_N (samples per occupancy category),
-// BENCH_PARAMS (JSON of parameter overrides, e.g. {"refine":0}), BENCH_ONLY=real|synth|track, BENCH_VERBOSE=1,
+// BENCH_PARAMS (JSON of parameter overrides, e.g. {"refine":0}), BENCH_ONLY=real|synth|track|realocc, BENCH_VERBOSE=1,
 // BENCH_TRACK=0 skips the tracking-mode pipeline timings, BENCH_TRACK_N (frames per tracking clip).
+// BENCH_ONLY=realocc runs only the real-photo occupancy bench (REALOCC_* options: see realOccBench.ts).
 import path from 'node:path';
 import fs from 'node:fs';
 import { test } from 'vitest';
@@ -11,6 +12,7 @@ import { encodePng } from './png';
 import { loadCv } from './cvNode';
 import { occupancyBench } from './occBench';
 import { trackingBench } from './trackBench';
+import { realOccBench } from './realOccBench';
 import { dumpFailure, formatTable, negativeCases, realCases, recallWhere, runCases, runCasesLocked, summarize, synthCases, type Outcome } from './bench';
 
 const OUT = path.resolve(import.meta.dirname, 'out');
@@ -33,7 +35,7 @@ test('bench', async () => {
   }
   const det = new Detector(cv);
   const t0 = Date.now();
-  const only = process.env.BENCH_ONLY; // 'real' | 'synth' | 'track'
+  const only = process.env.BENCH_ONLY; // 'real' | 'synth' | 'track' | 'realocc'
   const benchParams = JSON.parse(process.env.BENCH_PARAMS ?? '{}') as Record<string, number>;
   const track = () => {
     const t1 = Date.now();
@@ -41,6 +43,12 @@ test('bench', async () => {
   };
   if (only === 'track') {
     track();
+    det.dispose();
+    return;
+  }
+  if (only === 'realocc') {
+    const t1 = Date.now();
+    console.log(`\nreal-photo occupancy:\n${realOccBench(cv, det, benchParams)}  [${((Date.now() - t1) / 1000).toFixed(1)}s]`);
     det.dispose();
     return;
   }

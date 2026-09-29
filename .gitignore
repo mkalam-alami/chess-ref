@@ -4,3 +4,4 @@ test-results
 playwright-report
 *.log
 tests/synth/out/
+tests/synth/realocc-out/

@@ -23,3 +23,6 @@ Files starting with `neg-` contain no chessboard. They have no `corners.json` en
 
 ## Ground truth
 `corners.json` holds the 4 corners of the 8x8 playing area in 1920×1080 pixel coordinates, in clockwise order starting top-left. These are the outer corners of the 64 squares, not the black ring or the wooden frame. The file is to be produced by carefully annotating zoomed crops.
+
+## Occupancy bench
+`BENCH_ONLY=realocc npm run bench` runs the app pipeline (detection, then occupancy calibration from the starting position) on these photos and on any other fixture directory with the same `corners.json` format (default: this directory and `tests/fixtures/web`). It reports detection error, bootstrap state, orientation, per-cell accuracy and E/W/B confusion matrices split by square colour. It runs once on the detected corners and once on the GT corners, and writes a results JSON and overlay PNGs to `tests/synth/realocc-out/` (gitignored). `REALOCC_GRID_ONLY=1` renders only the GT annotation overlays (8×8 grid, a1/h1/h8/a8, white edge), for reviewing annotations. The options (`REALOCC_DIRS`, `REALOCC_HOLDOUT`, `REALOCC_BASELINE`, ...) are listed at the top of `tests/synth/realOccBench.ts`.
