@@ -6,3 +6,6 @@ playwright-report
 tests/synth/out/
 tests/synth/realocc-out/
 tests/tools/annot-out/
+
+# Private user-supplied board photos: never commit (images, annotations, sources)
+tests/fixtures/private/
