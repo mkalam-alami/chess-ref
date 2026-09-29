@@ -24,9 +24,6 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   await expect(page.locator('#cameraPick')).toBeHidden();
   await expect(page.locator('.dbg-camera')).toBeHidden();
 
-  // No board profile is locked without a board in view, so the reset button stays hidden.
-  await expect(page.locator('#resetBoard')).toBeHidden();
-
   // Every result carries an occupancy field: null (no board / dropped) or a 64-cell grid.
   await expect(app).toHaveAttribute('data-occupancy', /^(null|u8:64)$/, { timeout: 30_000 });
 

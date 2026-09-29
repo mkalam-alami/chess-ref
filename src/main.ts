@@ -62,15 +62,6 @@ let lastTimings: Record<string, number> = {};
 let confidence = 0;
 let mode = 'full';
 let profileText = describeProfile(null);
-const resetBoardBtn = $<HTMLButtonElement>('resetBoard');
-resetBoardBtn.addEventListener('click', () => {
-  worker.postMessage({ type: 'resetProfile' });
-  // The game survives a board reset; re-send its position to the fresh occupancy state.
-  hintKey = '';
-  sendHint();
-  resetBoardBtn.hidden = true;
-  profileText = describeProfile(null);
-});
 const modeCounts = { full: 0, tracking: 0 };
 
 // The worker keeps corners[k] = board corner k across frames (orientation is stabilised in TrackingSession), so
@@ -120,7 +111,6 @@ function handleResult(r: ResultMessage): void {
   lastTimings = r.timings;
   confidence = r.confidence;
   mode = r.mode;
-  resetBoardBtn.hidden = !r.profile;
   profileText = describeProfile(r.profile ?? null);
   modeCounts[r.mode]++;
   lastFrameW = r.width;
@@ -190,6 +180,9 @@ const moves = new MoveList($('moves'), {
     const prevPgn = game.pgn(pgnHeaders());
     archivePgn(prevPgn);
     game.newGame();
+    worker.postMessage({ type: 'resetProfile' });
+    hintKey = '';
+    profileText = describeProfile(null);
     handleGameEvents([], true);
     offerUndoNewGame(prevSave, prevPgn, 'New game');
   },
