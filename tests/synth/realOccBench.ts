@@ -42,6 +42,22 @@
  * cell the raw predicted class (E/W/B) on a green tag when right, or "pred>truth" on a red tag when wrong;
  * .grid is the GT annotation overlay; .fp marks a detection on a negative image.
  *
+ * Classification margin (per run, cells with GT): margin = NLL(best other class) - NLL(true class), in the tracker's own
+ * decision units: the per-class NLL (0.5 * sum over the 5 features of min(25, z^2) + log var) that update() argmins
+ * to get the raw class, on the illumination-corrected features of the last frame (tracker.debug.feats) and the class
+ * models as they were BEFORE that frame's learn() step (snapshotted from the tracker's private `models` field; nll /
+ * ZCAP are mirrored here since occupancy.ts does not export them). Negative = misclassified. Every run cross-checks
+ * the mirror: argmin must reproduce out.raw and the NLL differences must reproduce out.logLik (x temp / evidence
+ * weight); mismatches are logged as [warn]. "low" counts cells with margin < MARGIN_LOW = 4 NLL units (the default
+ * occMarginScale: the margin that gives full confidence; one NLL unit is 1/occLikTemp = 1/3 nat of logLik).
+ * Reported per image: min, p5, p10, median, low count, overall and per truth class x square colour (E/W/B x
+ * light/dark), the weakest group (lowest min margin).
+ * Start test: testStart (not exported) is mirrored on the last frame for both axes: score of the best axis vs 0.75,
+ * gap to the other axis vs 0.25, |dL| (L* of the white edge group - the black one) vs 6, as tryBootstrap requires,
+ * "head" = the smallest of (score - 0.75, gap - 0.25, (|dL| - 6) / 24) (negative = fails); sideOk = the labels it
+ * would calibrate on match the GT. Also the W - B separation of the calibrated models (L* and Lab distance of the
+ * means, per square colour).
+ *
  * Before/after workflow: run once with REALOCC_OUT=/tmp/before.json, change the code, then run with
  * REALOCC_BASELINE=/tmp/before.json to get per-image and per-group delta columns.
  */
@@ -51,6 +67,7 @@ import { createRequire } from 'node:module';
 import { applyH, homographyFrom4, invert3, mul3, type Mat3, type Point } from '../../src/geom/homography';
 import type { Detector } from '../../src/vision/detector';
 import { OCCUPANCY_PARAMS, OccupancyTracker, START_SQUARES, startGrid, type OccupancyResult } from '../../src/vision/occupancy';
+import { cameraFromHomography, cellFeatures, cellFootprints, NF, sampleFrame, type CellFeatures } from '../../src/vision/occupancy';
 import { param, type CV } from '../../src/vision/preprocess';
 import type { Params } from '../../src/worker/protocol';
 import { ERR_THRESHOLD } from './bench';
@@ -96,6 +113,44 @@ export interface RunResult {
   conf: { light: Confusion; dark: Confusion } | null;
   /** Raw classes in chess square order a1..h8 (E/W/B), from the GT orientation; null without GT. */
   rawSquares: string | null;
+  /** Classification margins (see the header); null without GT / models. */
+  margin?: MarginResult | null;
+  /** Mirrored start test on the last frame (null without a camera). */
+  startTest?: StartTestResult | null;
+  /** W - B separation of the calibrated models per square colour (null when not calibrated / no GT). */
+  modelSep?: { light: { dL: number; dLab: number }; dark: { dL: number; dLab: number } } | null;
+}
+
+export interface MarginStats {
+  n: number;
+  min: number;
+  p5: number;
+  p10: number;
+  median: number;
+  low: number;
+}
+
+export interface MarginResult {
+  thr: number;
+  /** Per-cell margin in board cell order (drawing only; stripped from the JSON). */
+  cells?: number[];
+  /** Per-cell margin in chess square order a1..h8 (2 decimals). */
+  squares: number[];
+  all: MarginStats;
+  /** Keys E/light, E/dark, W/light, ... */
+  byGroup: Record<string, MarginStats>;
+  weakest: string;
+}
+
+export interface StartTestResult {
+  axis: number;
+  score: number;
+  other: number;
+  gap: number;
+  dL: number;
+  pass: boolean;
+  head: number;
+  sideOk: boolean | null;
 }
 
 export interface ImageResult extends Omit<ImageMeta, 'dir'> {
@@ -248,14 +303,131 @@ const darkSquare = (sq: number) => ((sq & 7) + (sq >> 3)) % 2 === 0;
 
 const emptyConf = (): Confusion => [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
 
-export function runTracker(frame: { data: Uint8ClampedArray; width: number; height: number }, hb: Mat3, params: Params, orient: Uint8Array | null, aligned: boolean): { r: RunResult; out: OccupancyResult; truthCells: Uint8Array | null } {
+// Mirrors of occupancy.ts internals (not exported; keep in sync): nll / zdist / robustModel / testStart / tryBootstrap.
+const ZCAP = 25;
+const FLOOR = [2.5, 1.5, 1.5, 3, 2];
+const START_MIN_SCORE = 0.75;
+const START_MIN_GAP = 0.25;
+const START_MIN_DL = 6;
+/** Margin (NLL units) below which a cell counts as low-margin: the default occMarginScale (full confidence). */
+export const MARGIN_LOW = 4;
+interface Gauss { mu: Float64Array; v: Float64Array }
+type Models = [Gauss, Gauss][];
+const parityOf = (c: number) => ((c & 7) + (c >> 3)) & 1;
+function nllOf(x: Float32Array, c: number, g: Gauss): number {
+  let d = 0;
+  for (let f = 0; f < NF; f++) {
+    const z = x[c * NF + f]! - g.mu[f]!;
+    d += 0.5 * (Math.min(ZCAP, (z * z) / g.v[f]!) + Math.log(g.v[f]!));
+  }
+  return d;
+}
+function zdistOf(x: Float32Array, c: number, g: Gauss): number {
+  let d = 0;
+  for (let f = 0; f < NF; f++) {
+    const z = x[c * NF + f]! - g.mu[f]!;
+    d += Math.min(ZCAP, (z * z) / g.v[f]!);
+  }
+  return d;
+}
+function median(a: number[]): number {
+  const s = [...a].sort((p, q) => p - q);
+  const n = s.length;
+  return n === 0 ? 0 : n & 1 ? s[n >> 1]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
+}
+function robustModelOf(x: Float32Array, cells: number[]): Gauss {
+  const mu = new Float64Array(NF);
+  const v = new Float64Array(NF);
+  for (let f = 0; f < NF; f++) {
+    const vals = cells.map((c) => x[c * NF + f]!);
+    const m = median(vals);
+    const sd = Math.max(1.4826 * median(vals.map((q) => Math.abs(q - m))), FLOOR[f]!);
+    mu[f] = m;
+    v[f] = sd * sd;
+  }
+  return { mu, v };
+}
+/** Mirror of occupancy.ts testStart (score, dL; the lighter edge group is white). */
+function testStartMirror(feats: CellFeatures, axis: number, dev: number): { score: number; dL: number } {
+  const g = startGrid(axis, 0);
+  const { x, vis } = feats;
+  const empty: [number[], number[]] = [[], []];
+  const groups: [number[], number[]] = [[], []];
+  for (let c = 0; c < 64; c++) {
+    if (g[c] !== 0) groups[g[c] === 1 ? 0 : 1]!.push(c);
+    else if (vis[c]! >= 0.4) empty[parityOf(c)]!.push(c);
+  }
+  if (empty[0].length < 6 || empty[1].length < 6 || groups[0].length < 6 || groups[1].length < 6) return { score: 0, dL: 0 };
+  const em = [robustModelOf(x, empty[0]), robustModelOf(x, empty[1])];
+  let eOk = 0;
+  for (const p of [0, 1]) for (const c of empty[p]!) if (zdistOf(x, c, em[p]!) < dev) eOk++;
+  let oOk = 0;
+  const lsum = [[0, 0], [0, 0]];
+  const lcnt = [[0, 0], [0, 0]];
+  for (const gi of [0, 1])
+    for (const c of groups[gi]!) {
+      if (zdistOf(x, c, em[parityOf(c)]!) >= dev) oOk++;
+      lsum[gi]![parityOf(c)]! += x[c * NF]!;
+      lcnt[gi]![parityOf(c)]!++;
+    }
+  const score = (eOk / (empty[0].length + empty[1].length)) * (oOk / (groups[0].length + groups[1].length));
+  let dL = 0;
+  let np = 0;
+  for (const p of [0, 1])
+    if (lcnt[0]![p]! > 0 && lcnt[1]![p]! > 0) {
+      dL += lsum[0]![p]! / lcnt[0]![p]! - lsum[1]![p]! / lcnt[1]![p]!;
+      np++;
+    }
+  return { score, dL: np ? dL / np : 0 };
+}
+
+function startTestOf(frame: { data: Uint8ClampedArray; width: number; height: number }, hb: Mat3, params: Params, truthCells: Uint8Array | null): StartTestResult | null {
+  const cam = cameraFromHomography(hb, frame.width, frame.height, param(params, OCCUPANCY_PARAMS, 'occFovDeg'));
+  if (!cam) return null;
+  const fp = cellFootprints(cam, frame.width, frame.height, params);
+  const s = sampleFrame(frame, fp);
+  const dev = param(params, OCCUPANCY_PARAMS, 'occDeviation');
+  const t = [0, 1].map((axis) => {
+    const g = startGrid(axis, 0);
+    return testStartMirror(cellFeatures(fp, s, Array.from(g, (v) => (v === 0 ? 0 : 1))), axis, dev);
+  });
+  const axis = t[0]!.score >= t[1]!.score ? 0 : 1;
+  const b = t[axis]!;
+  const other = t[1 - axis]!.score;
+  const gap = b.score - other;
+  const head = Math.min(b.score - START_MIN_SCORE, gap - START_MIN_GAP, (Math.abs(b.dL) - START_MIN_DL) / 24);
+  const lab = startGrid(axis, b.dL >= 0 ? 0 : 1);
+  return {
+    axis, score: b.score, other, gap, dL: b.dL, pass: b.score >= START_MIN_SCORE && gap >= START_MIN_GAP && Math.abs(b.dL) >= START_MIN_DL,
+    head, sideOk: truthCells ? lab.every((v, c) => v === truthCells[c]) : null,
+  };
+}
+
+function quantile(sorted: number[], q: number): number {
+  if (!sorted.length) return NaN;
+  const i = q * (sorted.length - 1);
+  const lo = Math.floor(i);
+  return sorted[lo]! + (sorted[Math.min(sorted.length - 1, lo + 1)]! - sorted[lo]!) * (i - lo);
+}
+
+function marginStats(v: number[], thr: number): MarginStats {
+  const s = [...v].sort((a, b) => a - b);
+  return { n: s.length, min: s[0] ?? NaN, p5: quantile(s, 0.05), p10: quantile(s, 0.1), median: quantile(s, 0.5), low: s.filter((m) => m < thr).length };
+}
+
+const r2 = (x: number) => Math.round(x * 100) / 100;
+
+export function runTracker(frame: { data: Uint8ClampedArray; width: number; height: number }, hb: Mat3, params: Params, orient: Uint8Array | null, aligned: boolean): { r: RunResult; out: OccupancyResult; truthCells: Uint8Array | null; check: string } {
   const tr = new OccupancyTracker();
   const maxMs = param(params, OCCUPANCY_PARAMS, 'occFallbackMs') + 5 * FRAME_MS;
   let out: OccupancyResult;
   let f = 0;
   let bootFrame = -1;
   let framed = false;
+  const priv = tr as unknown as { models: Models | null };
+  let models: Models | null = null;
   for (;;) {
+    models = priv.models ? priv.models.map((m) => m.map((g) => ({ mu: new Float64Array(g.mu), v: new Float64Array(g.v) }))) as Models : null;
     out = tr.update(frame, hb, params, f * FRAME_MS);
     framed ||= out.observation.framed;
     if (bootFrame < 0 && out.stats.state !== 'start') bootFrame = f;
@@ -270,9 +442,12 @@ export function runTracker(frame: { data: Uint8ClampedArray; width: number; heig
   let conf: RunResult['conf'] = null;
   let rawSquares: string | null = null;
   let orientState: RunResult['orient'] = null;
+  let margin: MarginResult | null = null;
+  let modelSep: RunResult['modelSep'] = null;
+  let check = '';
+  const colourCell = new Uint8Array(64);
   if (orient) {
     truthCells = new Uint8Array(64);
-    const colourCell = new Uint8Array(64);
     for (let sq = 0; sq < 64; sq++) {
       truthCells[orient[sq]!] = START_SQUARES[sq]!;
       colourCell[orient[sq]!] = darkSquare(sq) ? 1 : 0;
@@ -292,14 +467,62 @@ export function runTracker(frame: { data: Uint8ClampedArray; width: number; heig
     rawSquares = Array.from({ length: 64 }, (_, sq) => CLS[out.raw[orient[sq]!]!]).join('');
     const o = out.orientation;
     orientState = !o ? 'none' : o.every((v, sq) => v === orient[sq]) ? 'ok' : 'wrong';
+    const feats = tr.debug?.feats;
+    if (models && feats && out.stats.state !== 'start') {
+      const temp = param(params, OCCUPANCY_PARAMS, 'occLikTemp');
+      const gamma = param(params, OCCUPANCY_PARAMS, 'occLikVisGamma');
+      const outlier = param(params, OCCUPANCY_PARAMS, 'occOutlier');
+      const m = new Array<number>(64);
+      let rawMis = 0;
+      let likErr = 0;
+      for (let c = 0; c < 64; c++) {
+        const p = parityOf(c);
+        const d = [0, 1, 2].map((k) => nllOf(feats.x, c, models![k]![p]!));
+        let arg = 0;
+        for (let k = 1; k < 3; k++) if (d[k]! < d[arg]!) arg = k;
+        if (arg !== out.raw[c]) rawMis++;
+        const t = truthCells[c]!;
+        m[c] = Math.min(...d.filter((_, k) => k !== t)) - d[t]!;
+        const near = Math.min(...[0, 1, 2].map((k) => zdistOf(feats.x, c, models![k]![p]!)));
+        const ew = Math.max(0, Math.min(1, feats.vis[c]!)) ** gamma * (near > outlier ? 0.25 : 1);
+        if (ew > 0.05)
+          for (let k = 0; k < 3; k++) {
+            const want = (-(d[k]! - d[0]!) / temp) * ew;
+            const got = out.logLik[c * 3 + k]! - out.logLik[c * 3]!;
+            likErr = Math.max(likErr, Math.abs(want - got));
+          }
+      }
+      if (rawMis || likErr > 1e-3) check = `margin mirror mismatch: ${rawMis} raw cell(s), logLik err ${likErr.toExponential(1)}`;
+      const byGroup: Record<string, MarginStats> = {};
+      let weakest = '';
+      for (const t of [0, 1, 2])
+        for (const col of [0, 1]) {
+          const key = `${CLS[t]}/${col ? 'dark' : 'light'}`;
+          const v = m.filter((_, c) => truthCells![c] === t && colourCell[c] === col);
+          if (!v.length) continue;
+          byGroup[key] = marginStats(v, MARGIN_LOW);
+          if (!weakest || byGroup[key].min < byGroup[weakest]!.min) weakest = key;
+        }
+      margin = { thr: MARGIN_LOW, cells: m, squares: Array.from({ length: 64 }, (_, sq) => r2(m[orient[sq]!]!)), all: marginStats(m, MARGIN_LOW), byGroup, weakest };
+      // W - B separation of the models the margins were computed with, per square colour.
+      const darkPar = parityOf(orient[0]!); // a1 is dark
+      const sep = (par: number) => {
+        const w = models![1]![par]!.mu;
+        const b = models![2]![par]!.mu;
+        return { dL: r2(w[0]! - b[0]!), dLab: r2(Math.hypot(w[0]! - b[0]!, w[1]! - b[1]!, w[2]! - b[2]!)) };
+      };
+      modelSep = { light: sep(1 - darkPar), dark: sep(darkPar) };
+    }
   }
+  const startTest = startTestOf(frame, hb, params, truthCells);
   return {
     r: {
       aligned, framed, boot, bootFrame, frames: f, orient: orientState, orientReason: tr.orientReason,
-      rawAcc, gridAcc, lowCells: out.stats.lowCells, conf, rawSquares,
+      rawAcc, gridAcc, lowCells: out.stats.lowCells, conf, rawSquares, margin, startTest, modelSep,
     },
     out,
     truthCells,
+    check,
   };
 }
 
@@ -470,7 +693,9 @@ export function drawGrid(cv: Canvas, gt: readonly Point[], whiteEdge: number | n
   cv.text(title, 6 * u, cv.h - 20 * u, 2 * u, WHITE);
 }
 
-function drawRun(cv: Canvas, s: number, hb: Mat3, gt: readonly Point[] | null, detQuad: readonly Point[] | null, out: OccupancyResult, truthCells: Uint8Array | null, title: string): void {
+const marginCells = (m: MarginResult, truth: Uint8Array | null): Float32Array | null => (truth && m.cells ? Float32Array.from(m.cells) : null);
+
+function drawRun(cv: Canvas, s: number, hb: Mat3, gt: readonly Point[] | null, detQuad: readonly Point[] | null, out: OccupancyResult, truthCells: Uint8Array | null, title: string, margins: Float32Array | null = null): void {
   const u = Math.max(1, Math.round(Math.max(cv.w, cv.h) / 800));
   if (gt) cv.quad(scalePts(gt, s), GREEN, 2 * u);
   if (detQuad) cv.quad(scalePts(detQuad, s), RED, 2 * u);
@@ -485,12 +710,14 @@ function drawRun(cv: Canvas, s: number, hb: Mat3, gt: readonly Point[] | null, d
     const pred = out.raw[c]!;
     const t = truthCells?.[c];
     const wrong = t !== undefined && t !== pred;
-    const label = wrong ? `${CLS[pred]}>${CLS[t]}` : CLS[pred]!;
-    const bg: RGB = t === undefined ? [60, 60, 60] : wrong ? RED : [0, 140, 0];
+    const mg = margins?.[c];
+    const label = (wrong ? `${CLS[pred]}>${CLS[t]}` : CLS[pred]!) + (mg === undefined ? '' : ` ${mg.toFixed(0)}`);
+    // Tag colour: red = wrong, orange = right with margin < MARGIN_LOW, green = right with a safe margin.
+    const bg: RGB = t === undefined ? [60, 60, 60] : wrong ? RED : mg !== undefined && mg < MARGIN_LOW ? [230, 120, 0] : [0, 140, 0];
     cv.centredText(label, x, y, sc, pred === 2 ? BLACK : pred === 1 ? WHITE : [255, 255, 160], bg, wrong ? 0.85 : 0.55);
   }
   cv.text(title, 6 * u, 6 * u, 2 * u, WHITE);
-  cv.text('GREEN GT  RED DETECTED  TAG=PRED(>TRUTH)', 6 * u, 26 * u, u + 1, WHITE);
+  cv.text(`GREEN GT  RED DETECTED  TAG=PRED(>TRUTH) MARGIN, ORANGE = MARGIN BELOW ${MARGIN_LOW}`, 6 * u, 26 * u, u + 1, WHITE);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -543,6 +770,40 @@ function report(results: ImageResult[], baseline: Map<string, ImageResult> | nul
   L.push('         orient = tracker orientation vs GT (a1 = corners[whiteEdge+1]); raw% = last-frame raw per-cell accuracy, grid% = committed grid; misal = detection not aligned with GT;');
   L.push('         errors = confusion off-diagonals truth>pred count on light squares / dark squares, for the GT-corner and the detected-corner runs.');
 
+  // Margins and start test per image.
+  const f1 = (x: number | null | undefined, w = 6) => (x === null || x === undefined || Number.isNaN(x) ? '-' : x.toFixed(1)).padStart(w);
+  const dM = (a: number | null | undefined, b: number | null | undefined) => (a === null || a === undefined || b === null || b === undefined ? '' : `${a - b >= 0 ? '+' : ''}${(a - b).toFixed(1)}`);
+  const mCol = (run: RunResult | null | undefined) => {
+    const m = run?.aligned ? run.margin : null;
+    return !m ? `${'-'.padStart(6)} ${'-'.padStart(6)} ${'-'.padStart(3)}  ${'-'.padEnd(8)} ${'-'.padStart(6)}` :
+      `${f1(m.all.min)} ${f1(m.all.p10)} ${String(m.all.low).padStart(3)}  ${m.weakest.padEnd(8)} ${f1(m.byGroup[m.weakest]?.p10)}`;
+  };
+  const stCol = (run: RunResult | null | undefined) => {
+    const t = run?.startTest;
+    return !t ? '-'.padEnd(34) : `${t.score.toFixed(2)} ${t.gap.toFixed(2)} ${f1(t.dL, 5)} ${t.pass ? 'pass' : 'FAIL'} ${f1(t.head * 100, 5)} ${t.sideOk === null ? '-' : t.sideOk ? 'ok' : 'SWAP'}`.padEnd(34);
+  };
+  const sepCol = (run: RunResult | null | undefined) => (run?.modelSep ? `${f1(run.modelSep.light.dL, 5)}/${f1(run.modelSep.dark.dL, 5)}` : '-');
+  L.push('');
+  const mh = `margins (NLL units, low < ${MARGIN_LOW})         | gt:  min    p10 low  weakest   wk p10 | det:  min    p10 low  weakest   wk p10 | gt start: score  gap    dL  ok   head side | det start: score  gap    dL  ok   head side | model W-B dL light/dark gt`;
+  L.push(mh + (baseline ? ' | d gt min p10 low  d det min p10 low' : ''));
+  for (const r of results) {
+    if (!r.hasGt) continue;
+    let line = `${r.file.replace(/\.jpe?g$/i, '').slice(0, 38).padEnd(38)} |     ${mCol(r.gt)} |      ${mCol(r.det)} |           ${stCol(r.gt)} |            ${stCol(r.det)} | ${sepCol(r.gt)}`;
+    if (baseline) {
+      const b = baseline.get(r.key);
+      const dd = (now: RunResult | null | undefined, was: RunResult | null | undefined) => {
+        const a = now?.aligned ? now.margin : null;
+        const w = was?.aligned ? was.margin : null;
+        return !a || !w ? '-' : `${dM(a.all.min, w.all.min)} ${dM(a.all.p10, w.all.p10)} ${a.all.low - w.all.low >= 0 ? '+' : ''}${a.all.low - w.all.low}`;
+      };
+      line += b ? ` | ${dd(r.gt, b.gt).padStart(16)}  ${dd(r.det, b.det).padStart(16)}` : ' | (new)';
+    }
+    L.push(line);
+  }
+  L.push(`margin = NLL(best other class) - NLL(true class) per cell (tracker decision units, negative = wrong); min / p10 over the 64 cells, low = cells below ${MARGIN_LOW};`);
+  L.push('         weakest = truth class / square colour with the lowest min margin (wk p10 = its p10). start = mirrored testStart on the last frame: best-axis score (>= 0.75),');
+  L.push('         gap to the other axis (>= 0.25), dL = white - black edge-group L* (|dL| >= 6), head = min(score-0.75, gap-0.25, (|dL|-6)/24) x 100, side = its W/B labels vs GT.');
+
   // Groups
   const groups = new Map<string, ImageResult[]>();
   for (const r of results) {
@@ -593,6 +854,31 @@ function report(results: ImageResult[], baseline: Map<string, ImageResult> | nul
     L.push(line);
   }
   L.push('(det raw% counts an undetected / misaligned board as 0%; err% is over OK detections)');
+
+  // Margin aggregates per group: mean of the per-image min / p10, summed low cells; per class x square colour, the
+  // worst per-image min and the summed low cells.
+  const gkeys = ['E/light', 'E/dark', 'W/light', 'W/dark', 'B/light', 'B/dark'];
+  L.push('');
+  L.push(`margin group     | mode  n  mean min  mean p10  low  | worst min / low per truth x square colour: ${gkeys.join('  ')}` + (baseline ? '  | baseline (common) mean min, mean p10, low' : ''));
+  for (const k of ordered) {
+    for (const mode of ['gt', 'det'] as const) {
+      const g = groups.get(k)!.filter((r) => r.hasGt && r[mode]?.aligned && r[mode]?.margin);
+      if (!g.length) continue;
+      const ms = g.map((r) => r[mode]!.margin!);
+      const gcol = gkeys.map((gk) => {
+        const v = ms.map((m) => m.byGroup[gk]).filter((x): x is MarginStats => !!x);
+        return v.length ? `${Math.min(...v.map((x) => x.min)).toFixed(1)}/${v.reduce((a, x) => a + x.low, 0)}` : '-';
+      });
+      let line = `${k.padEnd(16)} | ${mode.padEnd(4)} ${String(g.length).padStart(2)}  ${f1(mean(ms.map((m) => m.all.min)), 8)}  ${f1(mean(ms.map((m) => m.all.p10)), 8)}  ${String(ms.reduce((a, m) => a + m.all.low, 0)).padStart(3)}  | ${gcol.map((c) => c.padStart(9)).join(' ')}`;
+      if (baseline) {
+        const common = g.filter((r) => { const b = baseline.get(r.key)?.[mode]; return b?.aligned && b.margin; });
+        const now = common.map((r) => r[mode]!.margin!);
+        const was = common.map((r) => baseline.get(r.key)![mode]!.margin!);
+        line += common.length ? `  | ${common.length}: ${f1(mean(was.map((m) => m.all.min)), 0)}->${f1(mean(now.map((m) => m.all.min)), 0)}, ${f1(mean(was.map((m) => m.all.p10)), 0)}->${f1(mean(now.map((m) => m.all.p10)), 0)}, ${was.reduce((a, m) => a + m.all.low, 0)}->${now.reduce((a, m) => a + m.all.low, 0)}` : '  | -';
+      }
+      L.push(line);
+    }
+  }
 
   // Confusion matrices per group: GT-corner run and detected-corner run, each on light / dark squares.
   for (const k of ordered) {
@@ -677,7 +963,7 @@ export function realOccBench(cv: CV, det: Detector, params: Params = {}): string
       r.errMax = e.max;
       r.detOk = e.mean < ERR_THRESHOLD;
     } else if (gt) r.detOk = false;
-    const draws: { suffix: string; hb: Mat3; out: OccupancyResult; truth: Uint8Array | null; title: string }[] = [];
+    const draws: { suffix: string; hb: Mat3; out: OccupancyResult; truth: Uint8Array | null; margin?: MarginResult | null; title: string }[] = [];
     if (res.hb && !negative) {
       const orient = hasGt ? expectedOrientation(gt!, whiteEdge!, res.hb) : null;
       if (orient) {
@@ -690,19 +976,23 @@ export function realOccBench(cv: CV, det: Detector, params: Params = {}): string
       }
       const run = runTracker(frame, res.hb, params, orient, !hasGt || orient !== null);
       r.det = run.r;
-      draws.push({ suffix: 'det', hb: res.hb, out: run.out, truth: run.truthCells, title: `${m.file} DET ${r.detOk ? 'OK' : hasGt ? 'BAD' : ''} BOOT ${run.r.boot} RAW ${pct(run.r.rawAcc)}% ORIENT ${run.r.orient ?? '-'}` });
+      if (run.check) log.push(`[warn] ${m.key} det: ${run.check}`);
+      if (run.r.startTest && run.r.startTest.pass !== (run.r.boot === 'start')) log.push(`[warn] ${m.key} det: start-test mirror pass=${run.r.startTest.pass} but boot=${run.r.boot}`);
+      draws.push({ suffix: 'det', hb: res.hb, out: run.out, truth: run.truthCells, margin: run.r.margin, title: `${m.file} DET ${r.detOk ? 'OK' : hasGt ? 'BAD' : ''} BOOT ${run.r.boot} RAW ${pct(run.r.rawAcc)}% ORIENT ${run.r.orient ?? '-'}` });
     }
     if (hasGt) {
       const hb = homographyFrom4(BOARD, gt!)!;
       const orient = expectedOrientation(gt!, whiteEdge!, hb)!;
       const run = runTracker(frame, hb, params, orient, true);
       r.gt = run.r;
-      draws.push({ suffix: 'gt', hb, out: run.out, truth: run.truthCells, title: `${m.file} GT CORNERS BOOT ${run.r.boot} RAW ${pct(run.r.rawAcc)}% ORIENT ${run.r.orient ?? '-'}` });
+      if (run.check) log.push(`[warn] ${m.key} gt: ${run.check}`);
+      if (run.r.startTest && run.r.startTest.pass !== (run.r.boot === 'start')) log.push(`[warn] ${m.key} gt: start-test mirror pass=${run.r.startTest.pass} but boot=${run.r.boot}`);
+      draws.push({ suffix: 'gt', hb, out: run.out, truth: run.truthCells, margin: run.r.margin, title: `${m.file} GT CORNERS BOOT ${run.r.boot} RAW ${pct(run.r.rawAcc)}% ORIENT ${run.r.orient ?? '-'}` });
     }
     if (vis) {
       for (const d of draws) {
         const buf = new Uint8ClampedArray(vis.data);
-        drawRun(new Canvas(buf, vis.width, vis.height), vis.width / frame.width, d.hb, gt, res.corners, d.out, d.truth, d.title);
+        drawRun(new Canvas(buf, vis.width, vis.height), vis.width / frame.width, d.hb, gt, res.corners, d.out, d.truth, d.title, d.margin ? marginCells(d.margin, d.truth) : null);
         fs.writeFileSync(pngName(m, d.suffix), encodePng(buf, vis.width, vis.height));
         pngs++;
       }
@@ -728,6 +1018,6 @@ export function realOccBench(cv: CV, det: Detector, params: Params = {}): string
     head.push(`baseline: ${path.relative(REPO, bf)}`);
   }
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  fs.writeFileSync(outFile, JSON.stringify({ generatedAt: new Date().toISOString(), size, params, dirs, holdout: env.REALOCC_HOLDOUT || null, images: results }, null, 1));
+  fs.writeFileSync(outFile, JSON.stringify({ generatedAt: new Date().toISOString(), size, params, dirs, holdout: env.REALOCC_HOLDOUT || null, marginLow: MARGIN_LOW, images: results }, (k, v: unknown) => (k === 'cells' ? undefined : v), 1));
   return `${head.join('\n')}\n\n${report(results, baseline)}\n\nresults JSON: ${outFile}${pngDir ? `\noverlay PNGs (${pngs}): ${pngDir}` : ''}`;
 }
