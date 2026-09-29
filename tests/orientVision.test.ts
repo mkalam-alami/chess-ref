@@ -238,16 +238,17 @@ describe('OccupancyFilter', () => {
 });
 
 describe('OccupancyTracker learning guard', () => {
-  it('learn() only updates the models from confident cells whose label agrees with the frame class', () => {
+  it('learn() uses hint-labelled cells its label model explains, unless the frame confidently reads another class', () => {
     const tr = new OccupancyTracker();
     const g = (mu: number) => ({ mu: new Float64Array(5).fill(mu), v: new Float64Array(5).fill(100) });
     const models = [[g(50), g(50)], [g(80), g(80)], [g(20), g(20)]];
     const internals = tr as unknown as {
       models: typeof models;
-      learn(f: { x: Float32Array }, raw: Uint8Array, conf: Float32Array, labels: Uint8Array, p: Params): void;
+      learn(f: { x: Float32Array; vis: Float32Array }, raw: Uint8Array, conf: Float32Array, labels: Uint8Array | null, p: Params, dev: number): void;
     };
     internals.models = models;
     const x = new Float32Array(64 * 5);
+    const vis = new Float32Array(64).fill(1);
     const raw = new Uint8Array(64);
     const labels = new Uint8Array(64);
     const conf = new Float32Array(64);
@@ -258,24 +259,41 @@ describe('OccupancyTracker learning guard', () => {
     x.fill(0, 5, 10);
     raw[1] = OCC_WHITE;
     conf[1] = 1;
-    // Cell 3 (parity 1): agree on black but not confident enough -> ignored.
-    x.fill(0, 15, 20);
-    raw[3] = labels[3] = OCC_BLACK;
-    conf[3] = 0.5;
     // Cell 2 (parity 0): the label says black, the frame (confidently) white -> ignored.
     x.fill(0, 10, 15);
     raw[2] = OCC_WHITE;
     labels[2] = OCC_BLACK;
     conf[2] = 1;
-    internals.learn({ x }, raw, conf, labels, { occLearnRate: 0.1 });
+    // Cell 3 (parity 1): labelled black, near the black model, read white without confidence -> learnt (the margin
+    // does not select: dropping the low-margin tail biased the variances down, see learn()).
+    x.fill(15, 15, 20);
+    raw[3] = OCC_WHITE;
+    labels[3] = OCC_BLACK;
+    conf[3] = 0.3;
+    // Cell 4 (parity 1): labelled empty, not confidently read otherwise, but far from the empty model -> ignored.
+    x.fill(0, 20, 25);
+    conf[4] = 0.3;
+    // Cell 6 (parity 0): would be learnt, but hidden.
+    x.fill(60, 30, 35);
+    vis[6] = 0.1;
+    const learn = (l: Uint8Array | null) => internals.learn({ x, vis }, raw, conf, l, { occLearnRate: 0.1 }, 16);
+    // No hint (setup, or no game): nothing is learnt.
+    learn(null);
+    expect(models[OCC_EMPTY]![0]!.mu[0]).toBe(50);
+    learn(labels);
     expect(models[OCC_EMPTY]![0]!.mu[0]).toBeCloseTo(51, 6);
     expect(models[OCC_EMPTY]![1]!.mu[0]).toBe(50);
-    for (const cls of [OCC_WHITE, OCC_BLACK]) for (const p of [0, 1]) expect(models[cls]![p]!.mu.every((v) => v === (cls === OCC_WHITE ? 80 : 20))).toBe(true);
-    // Once the label agrees with the confident white reading of cell 1, it is learnt.
-    labels[1] = OCC_WHITE;
-    internals.learn({ x }, raw, conf, labels, { occLearnRate: 0.1 });
-    expect(models[OCC_WHITE]![1]!.mu[0]).toBeCloseTo(72, 6);
+    expect(models[OCC_BLACK]![1]!.mu[0]).toBeCloseTo(19.5, 6);
     expect(models[OCC_BLACK]![0]!.mu[0]).toBe(20);
+    for (const p of [0, 1]) expect(models[OCC_WHITE]![p]!.mu.every((v) => v === 80)).toBe(true);
+    // Once the label agrees with the confident white reading of cell 1, it is learnt... if the white model explains
+    // it: x = 72 is, x = 0 is not.
+    labels[1] = OCC_WHITE;
+    learn(labels);
+    expect(models[OCC_WHITE]![1]!.mu[0]).toBe(80);
+    x.fill(72, 5, 10);
+    learn(labels);
+    expect(models[OCC_WHITE]![1]!.mu[0]).toBeCloseTo(79.2, 6);
   });
 });
 
@@ -349,7 +367,7 @@ describe('orientation on rendered boards', () => {
       expect(outs[0]!.orientation).toBeNull();
       expect(outs[0]!.observation.oriented).toBe(false);
       const last = outs[outs.length - 1]!;
-      expect(last.stats.state).toBe('calibrated');
+      expect(last.stats.state).toBe('setup');
       expect(tr.oriented).toBe(true);
       expect(same(last.orientation, want)).toBe(true);
       expect(last.observation.oriented).toBe(true);
@@ -368,7 +386,7 @@ describe('orientation on rendered boards', () => {
       expect(b.flip).toBe(true);
       expect(expectedOrientation(b.corners, b.hb, true)).toBeNull();
       const { tr, outs } = calibrate(b, 8);
-      expect(outs[outs.length - 1]!.stats.state).toBe('calibrated');
+      expect(outs[outs.length - 1]!.stats.state).toBe('setup');
       for (const o of outs) {
         expect(o.orientation).toBeNull();
         expect(o.observation.oriented).toBe(false);
@@ -376,9 +394,10 @@ describe('orientation on rendered boards', () => {
         expect(same(o.observation.logLik, o.logLik)).toBe(true);
       }
       expect(tr.orientReason).toBe('parity');
-      // A hint is ignored while unoriented: the grid is the filter's own.
+      // A hint is ignored while unoriented: the grid is the filter's own, whatever the hint.
       const twin = calibrate(b, 8).tr;
       tr.setPosition(MID);
+      twin.setPosition(START_SQUARES);
       for (let t = 800; t < 1200; t += 100) {
         const o = tr.update(b.frame, b.hb, P, t);
         const w = twin.update(b.frame, b.hb, P, t);
@@ -405,7 +424,7 @@ describe('orientation on rendered boards', () => {
     let ok = 0;
     for (let s = 0; s < 64; s++) if (argmax3(o.observation.logLik, s) === START_SQUARES[s]) ok++;
     expect(ok).toBeGreaterThanOrEqual(56);
-    expect(o.observation.calibration).toBe('calibrated');
+    expect(o.observation.calibration).toBe('setup');
     expect(o.observation.stable).toBe(true);
   });
 
@@ -424,7 +443,7 @@ describe('orientation on rendered boards', () => {
       let agree = 0;
       for (let s = 0; s < 64; s++) if (argmax3(o.observation.logLik, s) === argmax3(o0.observation.logLik, s)) agree++;
       expect(agree).toBeGreaterThanOrEqual(60);
-      expect(o.stats.state).toBe('calibrated');
+      expect(o.stats.state).toBe('setup');
     }
   });
 
@@ -497,14 +516,16 @@ describe('orientation on rendered boards', () => {
     // A hint for a position the board now shows (after 1. e4) keeps the grid in place too.
     const e4 = board(DARK[2]![0], DARK[2]![1], DARK[2]![2], 1);
     for (let i = 0; i < 3; i++) expect(same(tr.update(e4.frame, e4.hb, P, (t += 100)).grid, toCellOrder(hint, orient))).toBe(true);
-    // No game: back to the per-cell filter, whose hysteresis starts from the hint's grid.
+    // No game: back to the provisional regime. The filter starts from the hint's grid; the frame's own reading comes
+    // back through the hysteresis, or sooner when the setup phase re-accepts the start (2 frames) and seeds it.
     tr.setPosition(null);
     const e2 = orient[sq('e2')]!;
     const e4c = orient[sq('e4')]!;
     const hold = 3; // occHoldFrames default
     for (let i = 1; i <= hold + 2; i++) {
       const o = tr.update(b.frame, b.hb, P, (t += 100));
-      if (i < hold) {
+      expect(o.stats.state).toBe(i < 2 ? 'start' : 'setup');
+      if (i < 2) {
         expect(o.grid![e2]).toBe(OCC_EMPTY);
         expect(o.grid![e4c]).toBe(OCC_WHITE);
       } else if (i >= hold + 1) {
@@ -629,6 +650,8 @@ describe('orientation on rendered boards', () => {
     expect(o.observation.framed).toBe(true);
     expect(o.observation.stable).toBe(true);
     expect(calls.learn).toBe(1);
+    // In setup the committed grid is the accepted start from the frame after the guard first passed.
+    o = step(tr, calls, b, (t += 100));
     const g0 = o.grid;
     let lastCrop = -Infinity;
     const path = [25, 50, 75, 100, 125, 150, 150, 150, 150, 125, 100, 75, 50, 25, 0];
@@ -724,7 +747,7 @@ describe('orientation on rendered boards', () => {
     let o = tr.update(b.frame, b.hb, P, (t += 66));
     expect(same(o.orientation, orient)).toBe(true);
     expect(o.observation.oriented).toBe(true);
-    expect(o.observation.calibration).toBe('calibrated');
+    expect(o.observation.calibration).toBe('setup');
     expect(o.observation.stable).toBe(false);
     expect(o.stats.frozen).toBe(true);
     o = tr.update(b.frame, b.hb, P, (t += 66));
@@ -743,7 +766,7 @@ describe('orientation on rendered boards', () => {
     t += 2000;
     o = tr.update(b.frame, b.hb, P, t);
     expect(tr.calibrated).toBe(true);
-    expect(o.stats.state).toBe('calibrated');
+    expect(o.stats.state).toBe('setup');
     expect(o.orientation).toBeNull();
     o = tr.update(b.frame, b.hb, P, (t += 100));
     expect(same(o.orientation, orient)).toBe(true);

@@ -112,3 +112,29 @@ Today the corner order is only stabilised on the **main thread** (`stabiliseCorn
 - `npm test`, `npm run typecheck`, `npm run build`, and `npm run e2e`. In the e2e smoke test, also assert that the result message carries a 64-cell grid.
 - Run `npm run bench` (the synthetic bench) before and after the change: detection accuracy and timing must not regress, and occupancy accuracy must meet the target.
 - Manual check on an Android phone, on the Pages URL: starting position (overhead and seated view), then a few moves, with hands passing over the board.
+
+## Setup phase (provisional calibration before lock-in)
+Live use showed trackers stuck in a wrong calibration: a weak two-frame start test had passed on the wrong thing (pieces still being placed, an earlier view), and nothing ever revisited the models. So calibration is now **provisional until the game locks in**. `OccupancyTracker` (`src/vision/occupancy.ts`) behaves as follows:
+- **Start test on every frame.** While no position hint is set, every framed frame runs the model-free start test (`testStart`) on both rank axes.
+  - The test is trimmed: `occSetupTrim` odd cells per group do not count.
+  - A pass (`occSetupScore`, `occSetupGap`, `occSetupDL`) adds 1 to that placement's leaky evidence, which decays by `occSetupDecay` per frame.
+  - A placement is accepted at `occSetupAccept` with a lead of 1 over the others, which means 2 consecutive passes.
+  - It is not accepted when a fresh fit on it still contradicts it on more than `occSetupBaseMax` cells. This covers mid-game boards that pass the trimmed test.
+  - The state is then **`setup`**.
+- **Recalibration.** When the current models contradict the accepted start on more than `occSetupRecal` visible cells, on a frame that passes the test, a fresh start fit is tried. It is adopted when it explains the frame clearly better. The origin of the bad models does not matter.
+  - A recalibration re-seeds the filter's committed grid.
+  - It unverifies an orientation that puts the start elsewhere.
+- **Cumulative calibration.** A frame is accumulated only when it passes the consistency guard: at most `occSetupGuard` contradicting cells (plus up to as many as the board's own fit cannot avoid) and at most that many outliers, not dropped, not frozen. Frames under a hand are frozen, so they are skipped.
+  - The per-frame models of the last `occSetupFrames` frames that passed are pooled: the median of the means, plus the median variance and the squared spread between frames.
+  - After `occSetupDrop` consecutive settled frames that fail the guard, the start is withdrawn and the state goes back to `start`. The models are kept.
+- **Optimism.** While a start is accepted:
+  - `logLik` gets a log-prior of `occSetupPrior` nats towards the start class.
+  - While frames agree with the start, the committed grid is the start grid.
+  - `raw` / `conf` stay the frame's own evidence.
+  - The game's `startConfident` check still gates lock-in, which accepts `setup` or `calibrated`.
+- **Lock-in and reset.** Once the hint arrives, the state is `calibrated` and the models are final. `learn()` then adapts them with the hint as labels. Clearing the hint (a new game) returns to the provisional regime.
+- **Fallback.** `fitUnsupervised` only runs while no start was ever accepted, after `occFallbackMs`. A later accepted start replaces its models.
+- **`learn()` drift fix.** Before the fix, repeating one static frame of fixture 04 degraded raw from 63 to 57/64. The root cause was that learning selected cells by the classifier's own confident agreement (conf ≥ 0.6). That drops each model's tail towards the other classes, so the variance estimated from the remaining cells is too small. The tighter model then excludes more tail cells, a positive feedback that collapsed the variances to their floors.
+  - `learn()` now uses the hint's labels only, not the tracker's own committed grid.
+  - It keeps a cell when the label's model explains it (zdist < `occDeviation`) and the frame does not confidently read it as another class.
+  - Before lock-in it does not run: the setup accumulation replaces it.

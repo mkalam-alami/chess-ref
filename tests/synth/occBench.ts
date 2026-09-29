@@ -89,10 +89,10 @@ export function occupancyBench(cv: CV, det: Detector, n: number, seed: number): 
         let out = tr.update(f0, hb, {}, t);
         if (!out.observation.framed) unframed++;
         for (let i = 1; i < FRAMES_PER_POS; i++) out = tr.update(f0, hb, {}, (t += 100));
-        if (out.stats.state === 'calibrated') boots++;
+        if (out.stats.state === 'setup' || out.stats.state === 'calibrated') boots++;
         if (!out.grid) startDrop++;
         else for (let c = 0; c < 64; c++) (startCells++, out.grid[c] === gt0[c] && startOk++);
-        if (out.stats.state !== 'calibrated') continue;
+        if (out.stats.state !== 'setup' && out.stats.state !== 'calibrated') continue;
         const flip = s0.meta.flip === 1;
         const want = expectedOrientation(s0.corners!, hb, flip);
         if (flip) orFlip++;

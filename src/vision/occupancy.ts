@@ -41,8 +41,34 @@ export const OCCUPANCY_PARAMS: readonly ParamSpec[] = [
   /** Outlier cells (matching no class model: hand remnants, glare) a calm frame may have beyond the calm baseline
    *  (the outlier count of the last settled frame). */
   { name: 'occSettleOutliers', min: 0, max: 16, step: 1, default: 0 },
-  /** Consecutive frames the starting position must be recognised before calibrating on it. */
-  { name: 'occBootFrames', min: 1, max: 10, step: 1, default: 2 },
+  /** Setup phase (no position hint, see docs/PLAN-occupancy.md "Setup phase"). Per-frame start test: least trimmed
+   *  score (fraction of middle cells fitting the empty model x fraction of edge cells deviating from it) ... */
+  { name: 'occSetupScore', min: 0.3, max: 1, step: 0.05, default: 0.7 },
+  /** ... least lead of that score over the other rank axis ... */
+  { name: 'occSetupGap', min: 0, max: 0.8, step: 0.05, default: 0.2 },
+  /** ... least lightness difference (L*) between the two edge groups (the lighter one is white) ... */
+  { name: 'occSetupDL', min: 0, max: 20, step: 0.5, default: 4 },
+  /** ... and the number of odd cells per group (middle / edge) the score ignores. */
+  { name: 'occSetupTrim', min: 0, max: 6, step: 1, default: 2 },
+  /** Leaky evidence per start placement: factor per framed frame, and the level (with a lead of 1 over the other
+   *  placements) at which a placement is accepted (1 + decay = two consecutive passes). */
+  { name: 'occSetupDecay', min: 0, max: 0.95, step: 0.05, default: 0.7 },
+  { name: 'occSetupAccept', min: 1, max: 4, step: 0.1, default: 1.6 },
+  /** Consistency guard: a setup frame is accumulated only when its own classification contradicts the accepted start
+   *  grid on at most this many visible cells. */
+  { name: 'occSetupGuard', min: 0, max: 12, step: 1, default: 4 },
+  /** A start placement is not accepted when a fresh calibration on it still contradicts it on more cells than this
+   *  (a mid-game board that passes the trimmed start test). */
+  { name: 'occSetupBaseMax', min: 0, max: 32, step: 1, default: 6 },
+  /** Above this many contradicting cells (on a frame passing the start test) a fresh calibration from the start labels
+   *  is tried, and adopted when it explains the frame clearly better. */
+  { name: 'occSetupRecal', min: 1, max: 32, step: 1, default: 6 },
+  /** This many consecutive settled frames failing the guard withdraw the accepted start (the board is not the start). */
+  { name: 'occSetupDrop', min: 1, max: 20, step: 1, default: 5 },
+  /** Setup frames kept for the cumulative calibration (models are refit from all of them). */
+  { name: 'occSetupFrames', min: 1, max: 16, step: 1, default: 8 },
+  /** Log-prior (nats) towards the accepted start grid's class added to every cell's logLik while in setup. */
+  { name: 'occSetupPrior', min: 0, max: 5, step: 0.25, default: 1.5 },
   /** Without a starting position for this long, calibrate unsupervised. */
   { name: 'occFallbackMs', min: 1000, max: 30000, step: 500, default: 8000 },
   /** Temperature of the per-cell class log-likelihoods (the five features are correlated, so their summed NLL is
@@ -593,6 +619,8 @@ export function startGrid(axis: number, side: number): Uint8Array {
 }
 
 const VIS_FIT = 0.4;
+/** Setup phase: while the frame agrees with the accepted start, the start test runs only on every this many frames. */
+const SETUP_TEST_EVERY = 4;
 /** Evidence weight kept by a cell that matches no class model. */
 const OUTLIER_EVIDENCE = 0.25;
 
@@ -609,8 +637,10 @@ interface StartTest {
 }
 
 /** Scores the starting-position hypothesis along one axis: middle lines fit one empty model per parity, the four
- *  outer lines deviate from it, and the two edge groups differ in lightness (the lighter one is white). */
-function testStart(fp: Footprints, s: Samples, axis: number, dev: number): StartTest {
+ *  outer lines deviate from it, and the two edge groups differ in lightness (the lighter one is white). Model-free
+ *  (the empty model is fitted on the frame itself). `trim` odd cells per group (a stained square, a piece off its
+ *  square) do not lower the score. */
+function testStart(fp: Footprints, s: Samples, axis: number, dev: number, trim = 0): StartTest {
   const g = startGrid(axis, 0);
   const prior = Array.from(g, (v) => (v === OCC_EMPTY ? 0 : 1));
   const feats = cellFeatures(fp, s, prior);
@@ -636,7 +666,9 @@ function testStart(fp: Footprints, s: Samples, axis: number, dev: number): Start
       lsum[gi]![parityOf(c)]! += x[c * NF]!;
       lcnt[gi]![parityOf(c)]!++;
     }
-  const score = (eOk / (empty[0].length + empty[1].length)) * (oOk / (groups[0].length + groups[1].length));
+  const nE = empty[0].length + empty[1].length;
+  const nO = groups[0].length + groups[1].length;
+  const score = Math.min(1, eOk / Math.max(1, nE - trim)) * Math.min(1, oOk / Math.max(1, nO - trim));
   let dL = 0;
   let np = 0;
   for (const p of [0, 1])
@@ -648,13 +680,13 @@ function testStart(fp: Footprints, s: Samples, axis: number, dev: number): Start
   return { score, side: dL >= 0 ? 0 : 1, dL, feats };
 }
 
-/** Per-class, per-parity models from a labelled grid; null when a class has too few visible cells. */
-function fitModels(feats: CellFeatures, grid: Uint8Array, dev: number): Models | null {
-  const { x, vis } = feats;
+/** Per-class, per-parity models from a labelled grid; null when a class has too few visible cells. `x` / `vis` may
+ *  hold several frames back to back (cell c of frame k at index k * 64 + c, parityOf is unchanged by the offset). */
+function fitModels(x: Float32Array, vis: Float32Array, grid: Uint8Array, dev: number): Models | null {
   const out: (Gauss | null)[][] = [];
   for (const cls of [OCC_EMPTY, OCC_WHITE, OCC_BLACK]) {
     const byP: [number[], number[]] = [[], []];
-    for (let c = 0; c < 64; c++) if (grid[c] === cls && vis[c]! >= VIS_FIT) byP[parityOf(c)]!.push(c);
+    for (let c = 0; c < vis.length; c++) if (grid[c & 63] === cls && vis[c]! >= VIS_FIT) byP[parityOf(c)]!.push(c);
     const mul = cls === OCC_EMPTY ? 1 : 1.5;
     let m = [robustModel(x, byP[0], mul), robustModel(x, byP[1], mul)];
     if (cls === OCC_EMPTY && m[0] && m[1]) {
@@ -705,6 +737,62 @@ function fitUnsupervised(feats: CellFeatures, dev: number): { grid: Uint8Array }
   for (const c of occupied) grid[c] = x[c * NF]! >= mid ? OCC_WHITE : OCC_BLACK;
   return { grid };
 }
+
+/**
+ * Cumulative model from per-frame models (the setup frames): per class, parity and feature, the median of the frames'
+ * means, and the median of their variances plus the spread of the means between frames (MAD, squared). Identical
+ * frames give back the per-frame model.
+ */
+function poolModels(frames: readonly Models[]): Models {
+  if (frames.length === 1) return frames[0]!.map((m) => [cloneGauss(m[0]), cloneGauss(m[1])]) as Models;
+  const out: Models = [];
+  for (let cls = 0; cls < 3; cls++) {
+    const pair: Gauss[] = [];
+    for (let p = 0; p < 2; p++) {
+      const mu = new Float64Array(NF);
+      const v = new Float64Array(NF);
+      for (let f = 0; f < NF; f++) {
+        const mus = frames.map((m) => m[cls]![p]!.mu[f]!);
+        const m = medianOf(mus);
+        const between = 1.4826 * medianOf(mus.map((q) => Math.abs(q - m)));
+        mu[f] = m;
+        v[f] = medianOf(frames.map((fm) => fm[cls]![p]!.v[f]!)) + between * between;
+      }
+      pair.push({ mu, v });
+    }
+    out.push(pair as [Gauss, Gauss]);
+  }
+  return out;
+}
+
+/** The frame's own classification: per cell, the class of least NLL (no prior). */
+function classifyCells(models: Models, x: Float32Array): Uint8Array {
+  const raw = new Uint8Array(64);
+  for (let c = 0; c < 64; c++) {
+    const p = parityOf(c);
+    let best = Infinity;
+    for (let cls = 0; cls < 3; cls++) {
+      const d = nll(x, c, models[cls]![p]!);
+      if (d < best) {
+        best = d;
+        raw[c] = cls;
+      }
+    }
+  }
+  return raw;
+}
+
+/** Visible cells whose class in `raw` differs from `grid`. */
+function contradictions(raw: Uint8Array, grid: Uint8Array, vis: Float32Array): number {
+  let n = 0;
+  for (let c = 0; c < 64; c++) if (vis[c]! >= VIS_FIT && raw[c] !== grid[c]) n++;
+  return n;
+}
+
+const sameGrid = (a: ArrayLike<number>, b: ArrayLike<number>) => {
+  for (let c = 0; c < 64; c++) if (a[c] !== b[c]) return false;
+  return true;
+};
 
 // ---------------------------------------------------------------------------------------------------------------
 // Temporal filter
@@ -770,6 +858,13 @@ export class OccupancyFilter {
     if (!(since < param(params, OCCUPANCY_PARAMS, 'occSettleMs'))) return false;
     if (since < param(params, OCCUPANCY_PARAMS, 'occSettleMinMs')) return true;
     return this.calm < param(params, OCCUPANCY_PARAMS, 'occSettleFrames');
+  }
+
+  /** Restarts the committed grid from `grid` (a (re)calibration): the per-cell hysteresis is dropped, the freeze
+   *  state and the per-cell reference are kept (a recalibration during a settle must not end it). */
+  seed(grid: Uint8Array): void {
+    this.setCommitted(grid);
+    this.count.fill(0);
   }
 
   /** Overrides the committed grid (position hint) without touching the freeze state. */
@@ -1047,30 +1142,62 @@ export function chooseOrientation(
  * per-parity class models calibrated on the starting position (or unsupervised after `occFallbackMs`), per-cell
  * confidence, frame dropping and the temporal filter.
  *
+ * Calibration is PROVISIONAL until the game locks in (see docs/PLAN-occupancy.md, "Setup phase"). While no position
+ * hint is set, every framed frame runs the model-free start test (testStart, trimmed) for the 4 start placements
+ * (rank axis x side) and accumulates leaky evidence per placement; one that leads is *accepted* (state 'setup'). In
+ * setup the models are (re)fitted from the start labels: from scratch when the current models contradict the start on
+ * more than `occSetupRecal` cells and a fresh fit explains the frame clearly better (whatever produced them: an early
+ * frame, the fallback, a wrong earlier acceptance), and cumulatively from the last `occSetupFrames` frames that pass
+ * the consistency guard (at most `occSetupGuard` contradicting cells, not dropped / frozen). logLik gets a log-prior
+ * `occSetupPrior` towards the start class, and while the frames agree with the start the committed grid is the start
+ * grid, so the game locks in fast. A placement whose own fresh fit still contradicts it on more than `occSetupBaseMax`
+ * cells is not accepted, and a board that keeps contradicting the start (`occSetupDrop` settled frames) loses its
+ * acceptance (mid-game boards). The unsupervised fallback only runs while no start was ever accepted. Once a hint is set
+ * the models are final ('calibrated') and only learn() adapts them, with the hint as labels; clearing the hint (a
+ * new game) returns to the provisional regime.
+ *
  * Orientation (milestone 9): which cell is which chess square. Found by chooseOrientation on stable frames, against
  * the position hint when one is set, else against the starting position (so the first orientation comes right after
  * the start-position calibration), and adopted after `occOrientFrames` consecutive agreeing frames. It is permuted
  * with the cells on dihedral relabellings, and marked unverified (not dropped: the class models survive too) after
- * more than `occLossMs` without a board or a relabelling that cannot be resolved; it is then re-found the same way.
- * Only reset() (the reset / resetProfile messages) drops the models and the orientation.
+ * more than `occLossMs` without a board, a relabelling that cannot be resolved, or a setup (re)calibration on a start
+ * placement it contradicts; it is then re-found the same way. Only reset() (the reset / resetProfile messages) drops
+ * the models and the orientation.
  *
  * Position hint (setPosition): while set and oriented it replaces the filter's committed grid (occluder prior,
  * illumination and learning labels, the returned grid); the filter then only detects freezes.
  */
 export class OccupancyTracker {
   private models: Models | null = null;
+  /** Where the models come from: a start calibration or the unsupervised fallback. */
+  private modelsFrom: 'start' | 'fallback' | null = null;
   /** Log reflectance per (class, parity) for the illumination field. */
   private refl: Float64Array = new Float64Array(6);
-  private state: OccupancyStats['state'] = 'start';
   private readonly filter = new OccupancyFilter();
-  private bootKey = -1;
-  private bootCount = 0;
   private firstSeenAt = NaN;
   private lastHb: Mat3 | null = null;
   private lastBoardAt = NaN;
   private lastStats: OccupancyStats = { state: 'start', empty: 0, white: 0, black: 0, lowCells: 0, dropped: false, frozen: false };
   /** Position hint from the game, chess square order; kept across reset() (the main thread owns it). */
   private hint: Uint8Array | null = null;
+  /** Setup phase: leaky start-test evidence per placement (key = axis * 2 + side, see startGrid). */
+  private readonly setupAcc = new Float64Array(4);
+  /** Accepted start placement (key, and its grid in the current cell frame); -1 / null when none. */
+  private setupKey = -1;
+  private setupGrid: Uint8Array | null = null;
+  /** Placement whose start test passed on the current frame (-1: none). */
+  private setupPass = -1;
+  /** Consecutive settled frames that failed the consistency guard. */
+  private setupFails = 0;
+  /** Contradicting cells of the last start (re)calibration frame under its own fit: what the classifier cannot help
+   *  getting wrong on this board; the guard allows up to `occSetupGuard` of them on top of `occSetupGuard`. */
+  private setupBase = 0;
+  /** Per-frame models of the setup frames that passed the guard (oldest first), pooled by the cumulative fit. */
+  private setupFrames: Models[] = [];
+  /** Whether the last setup frame agreed with the accepted start (guard passed), and frames since the last start
+   *  test: while agreeing, the start test only runs every SETUP_TEST_EVERY frames (its cost). */
+  private setupAgree = false;
+  private setupSkip = 0;
   /** Last orientation found (square -> cell), permuted with the cells; trusted only while `orientOk`. */
   private orient: Uint8Array | null = null;
   private orientOk = false;
@@ -1085,21 +1212,20 @@ export class OccupancyTracker {
   orientReason: OrientRefusal | 'uncalibrated' | '' = '';
   /** Footprints and weights of the last frame, for the debug view. */
   debug: OccupancyDebug | null = null;
-  /** Per-stage times (ms) of the last update(): occFootprints, occSample, occCalib, occFeatures, occClassify. */
+  /** Per-stage times (ms) of the last update(): occFootprints, occSample, occCalib, occFeatures, occClassify, occSetup. */
   timings: Record<string, number> = {};
 
-  /** Drops the models, the filter and the orientation (keeps the position hint). */
+  /** Drops the models, the filter, the setup evidence and the orientation (keeps the position hint). */
   reset(): void {
     this.models = null;
-    this.state = 'start';
+    this.modelsFrom = null;
     this.filter.reset();
-    this.bootKey = -1;
-    this.bootCount = 0;
     this.firstSeenAt = NaN;
     this.lastHb = null;
     this.lastBoardAt = NaN;
     this.orient = null;
     this.unverify();
+    this.withdrawSetup();
     this.parityUnchecked = false;
     this.filterStale = false;
     this.orientReason = '';
@@ -1119,14 +1245,21 @@ export class OccupancyTracker {
     return this.oriented ? new Uint8Array(this.orient!) : null;
   }
 
-  /** The game's position (64 entries, chess square order) or null (no game): see the class doc. */
+  /** The accepted start placement's grid (board cell order) while in setup, else null. */
+  get setupStart(): Uint8Array | null {
+    return !this.hint && this.setupGrid ? new Uint8Array(this.setupGrid) : null;
+  }
+
+  /** The game's position (64 entries, chess square order) or null (no game): see the class doc. Entering or leaving
+   *  the game restarts the setup evidence (a new game starts from a fresh start acceptance). */
   setPosition(grid: Uint8Array | null): void {
-    this.hint = grid && grid.length === 64 ? new Uint8Array(grid) : null;
+    const next = grid && grid.length === 64 ? new Uint8Array(grid) : null;
+    if ((next === null) !== (this.hint === null)) this.withdrawSetup();
+    this.hint = next;
   }
 
   noBoard(nowMs: number): OccupancyStats {
     this.filter.noBoard(nowMs);
-    this.bootCount = 0;
     this.lastStats = { ...this.lastStats, dropped: true, frozen: true, lowCells: 0 };
     return this.lastStats;
   }
@@ -1161,6 +1294,8 @@ export class OccupancyTracker {
         this.unverify();
         this.parityUnchecked = this.models !== null;
         this.filterStale = true;
+        // The accepted start placement belongs to the old cell frame.
+        this.withdrawSetup();
       }
     }
     this.lastHb = hb;
@@ -1171,21 +1306,23 @@ export class OccupancyTracker {
       this.lastStats = this.stats(0, true, false);
       return this.result(nowMs, null, raw, conf, logLik, new Float32Array(64), null, false, framed);
     };
+    this.setupPass = -1;
     if (!cam) return fail();
-    if (!framed) {
-      this.filter.noBoard(nowMs);
-      this.bootCount = 0;
-    }
+    if (!framed) this.filter.noBoard(nowMs);
     const fp = cellFootprints(cam, frame.width, frame.height, params);
     lap('occFootprints');
     const s = sampleFrame(frame, fp);
     lap('occSample');
     const dev = param(params, OCCUPANCY_PARAMS, 'occDeviation');
 
-    if (framed && this.state !== 'calibrated') this.tryBootstrap(fp, s, params, dev);
+    // Setup phase: the start test runs on every framed frame until the game locks in (provisional calibration).
+    if (framed && !this.hint && (!this.setupAgree || ++this.setupSkip >= SETUP_TEST_EVERY)) {
+      this.setupSkip = 0;
+      this.tryBootstrap(fp, s, params, dev);
+    }
     if (framed && !this.models && nowMs - this.firstSeenAt > param(params, OCCUPANCY_PARAMS, 'occFallbackMs')) {
       const u = fitUnsupervised(cellFeatures(fp, s, new Float32Array(64).fill(0.3)), dev);
-      if (u && this.calibrate(fp, s, u.grid, dev)) this.state = 'fallback';
+      if (u && this.calibrate(fp, s, u.grid, dev)) this.modelsFrom = 'fallback';
     }
     lap('occCalib');
     if (!this.models || !this.filter.committed) {
@@ -1193,9 +1330,12 @@ export class OccupancyTracker {
       return fail();
     }
 
-    // The position hint (when oriented) is the committed grid; the filter's own hysteresis is bypassed.
+    // The position hint (when oriented) is the committed grid; the filter's own hysteresis is bypassed. So is the
+    // accepted start grid in setup, while the frames agree with it (the consistency guard, see maintainSetup).
     const hintCells = this.hintCells();
     if (hintCells) this.filter.setCommitted(hintCells);
+    const setupHold = !this.hint && this.setupGrid !== null && this.setupAgree && !this.filterStale;
+    if (setupHold) this.filter.setCommitted(this.setupGrid!);
     const committed = this.filter.committed;
     // After an unresolved relabelling the committed grid belongs to another cell frame: used as the occluder prior and
     // the illumination labels it would make the frame read as that stale grid (and never re-orient), so until the next
@@ -1215,6 +1355,10 @@ export class OccupancyTracker {
     const scale = param(params, OCCUPANCY_PARAMS, 'occMarginScale');
     const temp = param(params, OCCUPANCY_PARAMS, 'occLikTemp');
     const visGamma = param(params, OCCUPANCY_PARAMS, 'occLikVisGamma');
+    // Setup: log-prior towards the accepted start grid in logLik (optimism before lock-in; the game's own check still
+    // gates it). raw / conf stay the frame's own evidence (the filter, freezes and the guards use them).
+    const startPrior = this.hint ? null : this.setupGrid;
+    const priorNats = startPrior ? param(params, OCCUPANCY_PARAMS, 'occSetupPrior') : 0;
     const d3 = [0, 0, 0];
     let sum = 0;
     let outliers = 0;
@@ -1240,7 +1384,7 @@ export class OccupancyTracker {
       const ew = Math.max(0, Math.min(1, feats.vis[c]!)) ** visGamma * (near > outlier ? OUTLIER_EVIDENCE : 1);
       let lse = -Infinity;
       for (let cls = 0; cls < 3; cls++) {
-        const l = (-(d3[cls]! - best) / temp) * ew;
+        const l = (-(d3[cls]! - best) / temp) * ew + (startPrior && startPrior[c] === cls ? priorNats : 0);
         logLik[c * 3 + cls] = l;
         lse = Math.max(lse, l) + Math.log1p(Math.exp(-Math.abs(lse - l)));
       }
@@ -1257,9 +1401,12 @@ export class OccupancyTracker {
     if (dropped && framed) this.filter.markUnstable(nowMs);
     let frozen = this.filter.frozen(nowMs, params);
     if (!dropped && framed) {
-      frozen = this.filter.update(raw, conf, params, nowMs, !hintCells, outliers);
-      if (!stale) this.learn(feats, raw, conf, this.filter.committed!, params);
+      frozen = this.filter.update(raw, conf, params, nowMs, !hintCells && !setupHold, outliers);
+      if (!stale) this.learn(feats, raw, conf, hintCells, params, dev);
     }
+    lap('occClassify');
+    if (framed && !stale && startPrior) this.maintainSetup(fp, s, feats, raw, dropped, frozen, outliers, params, dev);
+    lap('occSetup');
     const stable = framed && !dropped && !frozen;
     if (!this.orientOk && stable) this.tryOrient(logLik, hb, params);
     this.debug = { fp, weights: this.weights(fp, prior), raw, conf, feats };
@@ -1268,7 +1415,6 @@ export class OccupancyTracker {
     const committedProb = new Float32Array(64);
     for (let c = 0; c < 64; c++) committedProb[c] = Math.exp(logLik[c * 3 + committedNow[c]!]!);
     const grid = dropped || !framed ? null : new Uint8Array(committedNow);
-    lap('occClassify');
     return this.result(nowMs, grid, raw, conf, logLik, feats.vis, committedProb, stable, framed);
   }
 
@@ -1373,49 +1519,168 @@ export class OccupancyTracker {
     }
   }
 
+  /**
+   * Setup phase, start test of one framed frame (no hint): the trimmed, model-free testStart on both rank axes; a
+   * pass adds 1 to its placement's leaky evidence (all decay by `occSetupDecay` per frame). A placement whose evidence
+   * reaches `occSetupAccept` with a lead of 1 over every other is accepted: without start-calibrated models (none yet,
+   * or the fallback's) it calibrates at once; otherwise maintainSetup checks the models against it.
+   */
   private tryBootstrap(fp: Footprints, s: Samples, params: Params, dev: number): void {
-    const tests = [testStart(fp, s, 0, dev), testStart(fp, s, 1, dev)];
+    const trim = param(params, OCCUPANCY_PARAMS, 'occSetupTrim');
+    const tests = [testStart(fp, s, 0, dev, trim), testStart(fp, s, 1, dev, trim)];
     const axis = tests[0]!.score >= tests[1]!.score ? 0 : 1;
     const t = tests[axis]!;
     const other = tests[1 - axis]!;
-    if (!(t.score >= 0.75 && t.score - other.score >= 0.25 && Math.abs(t.dL) >= 6)) {
-      this.bootCount = 0;
-      return;
+    const decay = param(params, OCCUPANCY_PARAMS, 'occSetupDecay');
+    for (let k = 0; k < 4; k++) this.setupAcc[k]! *= decay;
+    if (
+      t.score >= param(params, OCCUPANCY_PARAMS, 'occSetupScore') &&
+      t.score - other.score >= param(params, OCCUPANCY_PARAMS, 'occSetupGap') &&
+      Math.abs(t.dL) >= param(params, OCCUPANCY_PARAMS, 'occSetupDL')
+    ) {
+      this.setupPass = axis * 2 + t.side;
+      this.setupAcc[this.setupPass]! += 1;
     }
-    const key = axis * 2 + t.side;
-    this.bootCount = key === this.bootKey ? this.bootCount + 1 : 1;
-    this.bootKey = key;
-    if (this.bootCount < param(params, OCCUPANCY_PARAMS, 'occBootFrames')) return;
-    if (this.calibrate(fp, s, startGrid(axis, t.side), dev)) this.state = 'calibrated';
+    let best = 0;
+    for (let k = 1; k < 4; k++) if (this.setupAcc[k]! > this.setupAcc[best]!) best = k;
+    let second = 0;
+    for (let k = 0; k < 4; k++) if (k !== best) second = Math.max(second, this.setupAcc[k]!);
+    const acc = this.setupAcc[best]!;
+    if (best === this.setupKey || acc < param(params, OCCUPANCY_PARAMS, 'occSetupAccept') || acc - second < 1) return;
+    const grid = startGrid(best >> 1, best & 1);
+    const fit = this.fitCalibration(fp, s, grid, dev);
+    if (!fit) return;
+    const base = contradictions(classifyCells(fit.models, fit.feats.x), grid, fit.feats.vis);
+    // Even a fit made for it cannot read this frame as the start: not the start (a mid-game board passing the trimmed
+    // test), whatever the test said.
+    if (base > param(params, OCCUPANCY_PARAMS, 'occSetupBaseMax')) return;
+    this.setupBase = base;
+    // Models from elsewhere (none yet, the fallback) are replaced at once; start-calibrated ones are checked against
+    // this start by maintainSetup (recalibrated when they contradict it).
+    if (this.modelsFrom !== 'start') {
+      this.adopt(fit);
+      this.setupFrames = [fit.models];
+    } else this.setupFrames = [];
+    this.setupKey = best;
+    this.setupGrid = grid;
+    this.setupFails = 0;
+    this.startCommitted(grid);
   }
 
-  /** Fits the illumination (reflectance per class and parity) and the class models on a labelled frame, using the
-   *  same occupancy prior as `update` so the models describe exactly the features `update` computes. */
-  private calibrate(fp: Footprints, s: Samples, grid: Uint8Array, dev: number): boolean {
+  /** Adopts a start calibration (fitCalibration). */
+  private adopt(fit: { models: Models; refl: Float64Array }): void {
+    this.models = fit.models;
+    this.refl = fit.refl;
+    this.modelsFrom = 'start';
+    this.parityUnchecked = false;
+    this.filterStale = false;
+  }
+
+  /**
+   * Setup phase, after the frame was classified: recalibration, cumulative calibration and the consistency guard
+   * against the accepted start grid (see the class doc). `own` is the frame's classification without the prior.
+   */
+  private maintainSetup(
+    fp: Footprints, s: Samples, feats: CellFeatures, own: Uint8Array, dropped: boolean, frozen: boolean, outliers: number,
+    params: Params, dev: number,
+  ): void {
+    const grid = this.setupGrid!;
+    const g0 = param(params, OCCUPANCY_PARAMS, 'occSetupGuard');
+    const guard = g0 + Math.min(g0, this.setupBase);
+    const n = contradictions(own, grid, feats.vis);
+    // Models that contradict an accepted start seen on this very frame: try a fresh fit from the start labels. Not
+    // while frozen (a hand: mass flips), but dropped frames count (wrong models make frames low-confidence).
+    if (n > param(params, OCCUPANCY_PARAMS, 'occSetupRecal') && this.setupPass === this.setupKey && !frozen) {
+      const fit = this.fitCalibration(fp, s, grid, dev);
+      if (fit) {
+        const n2 = contradictions(classifyCells(fit.models, fit.feats.x), grid, fit.feats.vis);
+        if (n2 <= guard || n2 <= n / 2) {
+          this.adopt(fit);
+          this.setupBase = n2;
+          this.setupFails = 0;
+          this.setupFrames = [fit.models];
+          this.setupAgree = n2 <= guard;
+          this.startCommitted(grid);
+          return;
+        }
+      }
+    }
+    this.setupAgree = n <= guard;
+    if (dropped || frozen) return;
+    if (n > guard || outliers > guard) {
+      if (++this.setupFails >= param(params, OCCUPANCY_PARAMS, 'occSetupDrop')) this.withdrawSetup();
+      return;
+    }
+    this.setupFails = 0;
+    const m = fitModels(feats.x, feats.vis, grid, dev);
+    if (!m) return;
+    this.setupFrames.push(m);
+    const keep = Math.max(1, param(params, OCCUPANCY_PARAMS, 'occSetupFrames'));
+    while (this.setupFrames.length > keep) this.setupFrames.shift();
+    this.models = poolModels(this.setupFrames);
+  }
+
+  /** Seeds the filter with the accepted start grid, and drops an orientation that puts the start elsewhere. */
+  private startCommitted(grid: Uint8Array): void {
+    this.filter.seed(grid);
+    if (this.orient && !sameGrid(toCellOrder(START_SQUARES, this.orient), grid)) this.unverify();
+  }
+
+  /** Forgets the accepted start placement and the setup evidence (the models stay). */
+  private withdrawSetup(): void {
+    this.setupAcc.fill(0);
+    this.setupKey = -1;
+    this.setupGrid = null;
+    this.setupPass = -1;
+    this.setupFails = 0;
+    this.setupFrames = [];
+    this.setupAgree = false;
+    this.setupSkip = 0;
+  }
+
+  /** Illumination (reflectance per class and parity) and class models fitted on a labelled frame, using the same
+   *  occupancy prior as `update` so the models describe exactly the features `update` computes. */
+  private fitCalibration(fp: Footprints, s: Samples, grid: Uint8Array, dev: number): { models: Models; refl: Float64Array; feats: CellFeatures } | null {
     const prior = priorOf(grid);
     const il = fitIllum(cellFeatures(fp, s, prior), grid);
-    const models = fitModels(cellFeatures(fp, s, prior, il.gains), grid, dev);
-    if (!models) return false;
-    this.models = models;
-    this.refl = il.refl;
-    this.filter.reset(grid);
+    const feats = cellFeatures(fp, s, prior, il.gains);
+    const models = fitModels(feats.x, feats.vis, grid, dev);
+    return models ? { models, refl: il.refl, feats } : null;
+  }
+
+  /** Calibrates on a labelled frame (fitCalibration) and restarts the filter from the labels. */
+  private calibrate(fp: Footprints, s: Samples, grid: Uint8Array, dev: number): boolean {
+    const fit = this.fitCalibration(fp, s, grid, dev);
+    if (!fit) return false;
+    this.models = fit.models;
+    this.refl = fit.refl;
+    if (this.filter.committed) this.filter.seed(grid);
+    else this.filter.reset(grid);
     this.parityUnchecked = false;
     this.filterStale = false;
     return true;
   }
 
   /**
-   * Slow EMA update of the class models. Learning guard: only cells whose label (the committed grid, i.e. the
-   * position hint in game mode) AND this frame's own confident classification (conf >= 0.6) agree are used, so a
-   * wrong game commit (or a wrong filter commit) never teaches a model the wrong label.
+   * Slow EMA update of the class models, in game mode only (`labels` = the position hint in cell order; null
+   * otherwise: before lock-in the setup phase calibrates, and the tracker's own committed grid is no label).
+   *
+   * Learning guard: a cell is used when it is visible, its label's model explains it (zdist < `occDeviation`: a wrong
+   * hint, e.g. a move not yet recognised, is far from it) and this frame does not confidently classify it otherwise
+   * (conf >= 0.6). The selection deliberately does NOT depend on the classifier margin: learning only from cells
+   * confidently agreeing drops each model's tail towards the other classes, so the variance estimated from the rest is
+   * too small; iterated over static frames, the tightened models exclude more tail cells, which tightens them further
+   * (models collapsed to their floors and cells flipped class on repeated frames of fixture 04).
    */
-  private learn(feats: CellFeatures, raw: Uint8Array, conf: Float32Array, labels: Uint8Array, params: Params): void {
+  private learn(feats: CellFeatures, own: Uint8Array, conf: Float32Array, labels: Uint8Array | null, params: Params, dev: number): void {
     const a = param(params, OCCUPANCY_PARAMS, 'occLearnRate');
-    if (!(a > 0) || !this.models) return;
+    if (!(a > 0) || !this.models || !labels) return;
     for (let c = 0; c < 64; c++) {
-      if (conf[c]! < 0.6 || raw[c] !== labels[c]) continue;
-      const g = this.models[raw[c]!]![parityOf(c)]!;
-      const floorMul = raw[c] === OCC_EMPTY ? 1 : 1.5;
+      const lab = labels[c]!;
+      if (feats.vis[c]! < VIS_FIT || (own[c] !== lab && conf[c]! >= 0.6)) continue;
+      const g = this.models[lab]![parityOf(c)]!;
+      if (!(zdist(feats.x, c, g) < dev)) continue;
+      const floorMul = lab === OCC_EMPTY ? 1 : 1.5;
       for (let f = 0; f < NF; f++) {
         const d = feats.x[c * NF + f]! - g.mu[f]!;
         g.mu[f] = g.mu[f]! + a * d;
@@ -1437,7 +1702,27 @@ export class OccupancyTracker {
     // A pending candidate was expressed in the old cell frame.
     this.orientCand = -1;
     this.orientCount = 0;
-    this.bootCount = 0;
+    // Setup evidence and frames follow the cells: old placement k becomes the placement whose grid is k's, permuted.
+    const acc = Float64Array.from(this.setupAcc);
+    const keyOf = (k: number) => {
+      const old = startGrid(k >> 1, k & 1);
+      const moved = Uint8Array.from({ length: 64 }, (_, c) => old[map[c]!]!);
+      for (let q = 0; q < 4; q++) if (sameGrid(moved, startGrid(q >> 1, q & 1))) return q;
+      return -1;
+    };
+    this.setupAcc.fill(0);
+    for (let k = 0; k < 4; k++) {
+      const q = keyOf(k);
+      if (q >= 0) this.setupAcc[q] = acc[k]!;
+    }
+    if (this.setupKey >= 0) {
+      this.setupKey = keyOf(this.setupKey);
+      this.setupGrid = this.setupKey >= 0 ? startGrid(this.setupKey >> 1, this.setupKey & 1) : null;
+      if (this.setupKey < 0) this.withdrawSetup();
+    }
+    this.setupPass = -1;
+    // Per-frame models are per parity: swapped like the current ones.
+    if (parityOf(map[0]!) !== 0) for (const fm of this.setupFrames) for (const m of fm) m.reverse();
   }
 
   private weights(fp: Footprints, prior: readonly number[]): Float32Array {
@@ -1450,13 +1735,25 @@ export class OccupancyTracker {
     return w;
   }
 
+  /**
+   * Calibration state (see OccupancyStats.state): 'calibrated' only in game mode (a position hint set: the game
+   * locked in); before that, 'setup' while a start placement is accepted, 'fallback' with unsupervised models, and
+   * 'start' otherwise (no models yet, or provisional ones on a board that is not the start).
+   */
+  private state(): OccupancyStats['state'] {
+    if (!this.models) return 'start';
+    if (this.modelsFrom === 'fallback') return 'fallback';
+    if (this.hint) return 'calibrated';
+    return this.setupGrid ? 'setup' : 'start';
+  }
+
   private stats(lowCells: number, dropped: boolean, frozen: boolean): OccupancyStats {
     const g = this.filter.committed;
     let white = 0;
     let black = 0;
     if (g && this.models) for (const v of g) v === OCC_WHITE ? white++ : v === OCC_BLACK ? black++ : 0;
     const empty = g && this.models ? 64 - white - black : 0;
-    return { state: this.state, empty, white, black, lowCells, dropped, frozen };
+    return { state: this.state(), empty, white, black, lowCells, dropped, frozen };
   }
 }
 

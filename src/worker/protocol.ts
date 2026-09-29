@@ -120,7 +120,8 @@ export interface Observation {
   vis: Float32Array;
   /** Whether vision knows which cell is a1 (the arrays are then in chess square order). */
   oriented: boolean;
-  /** Occupancy calibration state (OccupancyStats.state); the game only locks in on 'calibrated' (from the start position). */
+  /** Occupancy calibration state (OccupancyStats.state); the game only locks in on 'setup' (a starting position
+   *  accepted, provisional models fitted on it) or 'calibrated'. */
   calibration: OccupancyStats['state'];
   /** False on frames that must not count as evidence: dropped, frozen (hand / mass change), just after a board loss,
    *  not `framed`, or while the board settles after any of these (adaptive: `occSettleFrames` calm frames and at
@@ -136,8 +137,13 @@ export const OCC_WHITE = 1;
 export const OCC_BLACK = 2;
 
 export interface OccupancyStats {
-  /** 'start' = waiting for the starting position to calibrate; 'calibrated' = models learned from it; 'fallback' = unsupervised. */
-  state: 'start' | 'calibrated' | 'fallback';
+  /**
+   * 'start' = no starting position accepted (no models yet, or provisional ones on a board that is not the start);
+   * 'setup' = before lock-in (no position hint), a starting position is accepted and the models are being (re)fitted
+   * on it, provisionally; 'calibrated' = the game locked in (a position hint is set): the models are final (only
+   * adapted by learning on the hint); 'fallback' = unsupervised models (no starting position seen yet).
+   */
+  state: 'start' | 'setup' | 'calibrated' | 'fallback';
   empty: number;
   white: number;
   black: number;

@@ -2,10 +2,12 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { mul3, type Mat3 } from '../src/geom/homography';
 import { Detector } from '../src/vision/detector';
 import type { CV } from '../src/vision/preprocess';
-import { boardFramed, cameraFromHomography, cellFootprints, type FrameRect, OCCUPANCY_PARAMS, OccupancyFilter, OccupancyTracker, startGrid } from '../src/vision/occupancy';
+import { boardFramed, cameraFromHomography, cellFootprints, type FrameRect, OCCUPANCY_PARAMS, OccupancyFilter, OccupancyTracker, sampleFrame, START_SQUARES, startGrid } from '../src/vision/occupancy';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE, type Params } from '../src/worker/protocol';
 import { realCases } from './synth/bench';
 import { alignGt, FRAME_CORNERS_ONLY, GAME } from './synth/occBench';
+
+const same = (a: ArrayLike<number> | null, b: ArrayLike<number>) => !!a && Array.from(a).every((v, i) => v === b[i]);
 import { loadCv } from './synth/cvNode';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -271,7 +273,7 @@ describe('occupancy on synthetic starting positions', () => {
           let out = tr.update(frame, r.hb, P, 0);
           for (let t = 1; t < 5; t++) out = tr.update(frame, r.hb, P, t * 100);
           ev.n++;
-          if (out.stats.state === 'calibrated') ev.boots++;
+          if (out.stats.state === 'setup') ev.boots++;
           let rawOk = 0;
           for (let c = 0; c < 64; c++) if (out.raw[c] === gt[c]) rawOk++;
           ev.rawAcc += rawOk / 64;
@@ -329,7 +331,7 @@ describe('occupancy class log-likelihoods', () => {
             out = tr.update(f0, r.hb, P, (t += 100));
             outLin = twin.update(f0, r.hb, lin, t);
           }
-          if (out.stats.state !== 'calibrated') continue;
+          if (out.stats.state !== 'setup') continue;
           for (let m = 0; m <= 3; m++) {
             const s = makeBoardSample(cv, sd, { elev, palette, pieces: 'start' }, GAME.slice(0, m));
             const gt = alignGt(s.occupancy!, s.corners!, r.hb)!;
@@ -415,7 +417,7 @@ describe('occupancy on real starting-position photos', () => {
         tr.update(frame, r.hb, {}, t * 100);
         times.push(performance.now() - t0);
       }
-      if (out.stats.state === 'calibrated') boots++;
+      if (out.stats.state === 'setup') boots++;
       let rawOk = 0;
       for (let k = 0; k < 64; k++) if (out.raw[k] === gt[k]) rawOk++;
       rawSum += rawOk / 64;
@@ -437,4 +439,198 @@ describe('occupancy on real starting-position photos', () => {
     expect(rawSum / n).toBeGreaterThanOrEqual(0.9);
     expect(med).toBeLessThan(10); // loose: CI machines vary; the target is < 3 ms
   }, 120_000);
+});
+
+describe('occupancy setup phase (provisional calibration before lock-in)', () => {
+  let cv: CV;
+  let det: Detector;
+  beforeAll(async () => {
+    ({ cv } = await loadCv());
+    det = new Detector(cv);
+  }, 60_000);
+
+  type Frame = { data: Uint8ClampedArray; width: number; height: number };
+  interface Internals {
+    calibrate(fp: unknown, s: unknown, g: Uint8Array, dev: number): boolean;
+    models: unknown;
+    setupFrames: unknown[];
+  }
+  const internals = (tr: OccupancyTracker) => tr as unknown as Internals;
+  const models = (tr: OccupancyTracker) =>
+    JSON.stringify(internals(tr).models, (_, v) => (v instanceof Float64Array ? Array.from(v) : v));
+  const correct = (a: Uint8Array | null, gt: Uint8Array) => (a ? Array.from(a).filter((v, c) => v === gt[c]).length : -1);
+  /** Calibrates a tracker on `grid` (a wrong labelling of the frame) through its private calibrate. */
+  function wronglyCalibrated(frame: Frame, hb: Mat3, params: Params, grid: Uint8Array): OccupancyTracker | null {
+    const tr = new OccupancyTracker();
+    const cam = cameraFromHomography(hb, frame.width, frame.height)!;
+    const fp = cellFootprints(cam, frame.width, frame.height, params);
+    // Null when a class of `grid` has too few visible cells to fit.
+    return internals(tr).calibrate(fp, sampleFrame(frame, fp), grid, 16) ? tr : null;
+  }
+  /** Wrong labellings of a start frame: the other side, the other axis, and a partial start (only the pawns placed,
+   *  as when the bootstrap fired while the pieces were being set up). */
+  const wrongGrids = (gt: Uint8Array): Uint8Array[] => {
+    const other = [startGrid(0, 0), startGrid(0, 1), startGrid(1, 0), startGrid(1, 1)].filter((g) => !same(g, gt));
+    const axis = [0, 1].find((a) => same(startGrid(a, 0), gt) || same(startGrid(a, 1), gt))!;
+    const partial = Uint8Array.from(gt, (v, c) => ([0, 7].includes(axis === 0 ? c >> 3 : c & 7) ? OCC_EMPTY : v));
+    return [...other, partial];
+  };
+
+  const realStarts = () => {
+    const meta = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/real/corners.json'), 'utf8')) as Record<string, { whiteEdge?: number }>;
+    const out: { name: string; frame: Frame; hb: Mat3; gt: Uint8Array }[] = [];
+    for (const c of realCases(cv, 640)) {
+      const edge = meta[`${c.name.split('@')[0]}.jpg`]?.whiteEdge;
+      if (edge === undefined || !c.gt) continue;
+      const frame = { data: c.rgba, width: c.width, height: c.height };
+      const r = det.detect(frame as unknown as ImageData, {});
+      const gt = r.hb ? alignGt([startGrid(0, 0), startGrid(1, 1), startGrid(0, 1), startGrid(1, 0)][edge]!, c.gt, r.hb) : null;
+      if (r.hb && gt) out.push({ name: c.name, frame, hb: r.hb, gt });
+    }
+    return out;
+  };
+
+  it('recovers from wrong models (wrong side / axis, partial start) once the start is shown, before any hint', () => {
+    const cases: { name: string; frame: Frame; hb: Mat3; gt: Uint8Array; params: Params }[] = realStarts().map((c) => ({ ...c, params: {} }));
+    for (const [seed, elev, palette] of [[9000, 'overhead', 'wood'], [9005, 'overhead', 'vinyl'], [9020, 'oblique', 'vinyl'], [9026, 'oblique', 'printed']] as const) {
+      const s = makeBoardSample(cv, seed, { elev, palette, pieces: 'start' });
+      const frame = { data: s.rgba, width: s.width, height: s.height };
+      const r = det.detect(frame as unknown as ImageData, {});
+      const gt = r.hb && s.corners ? alignGt(s.occupancy!, s.corners, r.hb) : null;
+      if (r.hb && gt) cases.push({ name: s.label + '-' + seed, frame, hb: r.hb, gt, params: P });
+    }
+    expect(cases.length).toBeGreaterThanOrEqual(9);
+    const lines: string[] = [];
+    let tried = 0;
+    for (const c of cases) {
+      // Clean reference: a fresh tracker on the same frame.
+      const ref = new OccupancyTracker();
+      let o = ref.update(c.frame, c.hb, c.params, 0);
+      for (let t = 1; t < 5; t++) o = ref.update(c.frame, c.hb, c.params, t * 100);
+      const clean = correct(o.raw, c.gt);
+      const cleanGrid = correct(o.grid, c.gt);
+      for (const wrong of wrongGrids(c.gt)) {
+        const tr = wronglyCalibrated(c.frame, c.hb, c.params, wrong);
+        if (!tr) continue;
+        tried++;
+        let out = tr.update(c.frame, c.hb, c.params, 0);
+        const before = correct(out.raw, c.gt);
+        for (let t = 1; t < 6; t++) out = tr.update(c.frame, c.hb, c.params, t * 100);
+        lines.push(`${c.name}: wrong models raw ${before} -> ${correct(out.raw, c.gt)} grid ${correct(out.grid, c.gt)} (clean ${clean}/${cleanGrid}) ${out.stats.state} start ${same(tr.setupStart, c.gt)}`);
+        expect(out.stats.state).toBe('setup');
+        expect(same(tr.setupStart, c.gt)).toBe(true);
+        expect(correct(out.raw, c.gt)).toBeGreaterThanOrEqual(clean);
+        expect(correct(out.grid, c.gt)).toBeGreaterThanOrEqual(cleanGrid);
+      }
+    }
+    console.log(lines.join('\n'));
+    expect(tried).toBeGreaterThanOrEqual(30);
+  }, 180_000);
+
+  it('never accepts a mid-game board as the start (no setup state, no start grid)', () => {
+    let n = 0;
+    let seed = 7000;
+    for (const elev of ['overhead', 'oblique'] as const)
+      for (const palette of ['wood', 'vinyl', 'printed'] as const)
+        for (let k = 0; k < 3; k++) {
+          const sd = seed++;
+          const s0 = makeBoardSample(cv, sd, { elev, palette, pieces: 'start' });
+          const r = det.detect({ data: s0.rgba, width: s0.width, height: s0.height } as unknown as ImageData, {});
+          if (!r.hb) continue;
+          // Random piece sets (the generator's 'some' mode), and the game position after 4. Bxc6 (11 cells off the start).
+          const boards: { frame: Frame; hb: Mat3; kind: string }[] = [];
+          const mid = makeBoardSample(cv, sd, { elev, palette, pieces: 'start' }, GAME);
+          boards.push({ frame: { data: mid.rgba, width: mid.width, height: mid.height }, hb: r.hb, kind: 'game' });
+          const some = makeBoardSample(cv, sd + 500, { elev, palette, pieces: 'some' });
+          const rs = det.detect({ data: some.rgba, width: some.width, height: some.height } as unknown as ImageData, {});
+          if (rs.hb) boards.push({ frame: { data: some.rgba, width: some.width, height: some.height }, hb: rs.hb, kind: 'some' });
+          for (const b of boards) {
+            const tr = new OccupancyTracker();
+            n++;
+            for (let i = 0; i < 20; i++) {
+              const o = tr.update(b.frame, b.hb, P, i * 100);
+              if (b.kind === 'some') {
+                expect(o.stats.state).not.toBe('setup');
+                expect(tr.setupStart).toBeNull();
+              }
+            }
+            // The game position may pass the trimmed start test on a frame, but never stays accepted.
+            expect(tr.setupStart).toBeNull();
+          }
+        }
+    expect(n).toBeGreaterThanOrEqual(24);
+  }, 180_000);
+
+  it('does not accumulate hand-occluded frames in setup, and keeps the models through them', () => {
+    const s = makeBoardSample(cv, 9000, { elev: 'overhead', palette: 'wood', pieces: 'start' });
+    const frame = { data: s.rgba, width: s.width, height: s.height };
+    const hb = det.detect(frame as unknown as ImageData, {}).hb!;
+    const gt = alignGt(s.occupancy!, s.corners!, hb)!;
+    const tr = new OccupancyTracker();
+    let t = 0;
+    for (let i = 0; i < 6; i++) tr.update(frame, hb, P, (t += 100));
+    expect(tr.setupStart).not.toBeNull();
+    const kept = internals(tr).setupFrames.length;
+    const m0 = models(tr);
+    /** A skin-coloured blob over board cells [x0, x1) x [y0, y1). */
+    const withHand = (x0: number, y0: number, x1: number, y1: number): Frame => {
+      const data = new Uint8ClampedArray(frame.data);
+      const pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(([x, y]) => {
+        const w = hb[6] * x! + hb[7] * y! + hb[8];
+        return [(hb[0] * x! + hb[1] * y! + hb[2]) / w, (hb[3] * x! + hb[4] * y! + hb[5]) / w];
+      });
+      const [ax, bx] = [Math.min(...pts.map((p) => p[0]!)), Math.max(...pts.map((p) => p[0]!))];
+      const [ay, by] = [Math.min(...pts.map((p) => p[1]!)), Math.max(...pts.map((p) => p[1]!))];
+      for (let y = Math.max(0, Math.floor(ay)); y < Math.min(frame.height, by); y++)
+        for (let x = Math.max(0, Math.floor(ax)); x < Math.min(frame.width, bx); x++) {
+          const o = (y * frame.width + x) * 4;
+          const q = ((x * 7 + y * 13) % 11) - 5;
+          data[o] = 215 + q;
+          data[o + 1] = 160 + q;
+          data[o + 2] = 125 + q;
+        }
+      return { data, width: frame.width, height: frame.height };
+    };
+    for (const box of [[2, 0, 6, 4], [3, 0, 6, 5], [2, 1, 7, 5], [1, 2, 5, 6]] as [number, number, number, number][]) {
+      const o = tr.update(withHand(...box), hb, P, (t += 66));
+      expect(o.observation.stable).toBe(false);
+      expect(internals(tr).setupFrames.length).toBe(kept);
+      expect(models(tr)).toBe(m0);
+    }
+    // Hand gone: the start is still accepted and read right; accumulation resumes once settled.
+    let o = tr.update(frame, hb, P, (t += 100));
+    for (let i = 0; i < 5; i++) o = tr.update(frame, hb, P, (t += 100));
+    expect(same(tr.setupStart, gt)).toBe(true);
+    expect(o.stats.state).toBe('setup');
+    expect(correct(o.grid, gt)).toBe(64);
+  }, 120_000);
+
+  it('repeated static frames do not degrade raw or grid on any real photo (setup, then with the game hint)', () => {
+    const lines: string[] = [];
+    for (const c of realStarts()) {
+      const tr = new OccupancyTracker();
+      let t = 0;
+      let o = tr.update(c.frame, c.hb, {}, t);
+      for (let i = 1; i < 5; i++) o = tr.update(c.frame, c.hb, {}, (t += 100));
+      const raw0 = correct(o.raw, c.gt);
+      const grid0 = correct(o.grid, c.gt);
+      let worstRaw = 64;
+      let worstGrid = 64;
+      for (let i = 0; i < 200; i++) {
+        o = tr.update(c.frame, c.hb, {}, (t += 100));
+        // After 100 setup frames the game locks in: the hint (the start) labels the learning from then on.
+        if (i === 100) {
+          expect(o.orientation).not.toBeNull();
+          tr.setPosition(START_SQUARES);
+        }
+        if (i > 101) expect(o.stats.state).toBe('calibrated');
+        worstRaw = Math.min(worstRaw, correct(o.raw, c.gt));
+        worstGrid = Math.min(worstGrid, correct(o.grid, c.gt));
+      }
+      lines.push(`${c.name}: raw ${raw0} worst ${worstRaw}, grid ${grid0} worst ${worstGrid}`);
+      expect(worstRaw).toBeGreaterThanOrEqual(raw0);
+      expect(worstGrid).toBeGreaterThanOrEqual(grid0);
+    }
+    console.log(lines.join('\n'));
+  }, 180_000);
 });

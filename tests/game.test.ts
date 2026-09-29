@@ -173,6 +173,11 @@ describe('GameTracker lock-in', () => {
     expect(sim.show(START_GRID, 600)).toEqual([{ type: 'started' }]);
   });
 
+  it("locks in on vision's provisional setup calibration too", () => {
+    const sim = new Sim();
+    expect(sim.show(START_GRID, 1500, { calibration: 'setup' })).toEqual([{ type: 'started' }]);
+  });
+
   it('does not lock in on fallback calibration, unoriented frames, or a wrong setup', () => {
     for (const o of [{ calibration: 'fallback' as const }, { calibration: 'start' as const }, { oriented: false }]) {
       const sim = new Sim();

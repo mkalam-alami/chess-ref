@@ -155,7 +155,7 @@ function replay(moves: readonly string[]): { chess: Chess; played: Move[] } | nu
  *
  * Pipeline per oriented frame (see docs/PLAN-game.md, "Game layer"):
  * - waiting: lock in once the starting position is confidently observed over `lockHoldMs` of stable frames on a
- *   calibrated tracker;
+ *   tracker calibrated on it ('setup' / 'calibrated');
  * - playing: every stable frame updates the revisable move lattice (hypotheses = move sequences of 0..K+1 plies from the
  *   anchor, K = revisionDepth plies behind the tip); the argmax replaces the committed window when it beats the
  *   incumbent (advance: τ_move / t_hold; revision or takeback: τ_revise / t_revise, with per-ply cooldown) and the best
@@ -250,7 +250,9 @@ export class GameTracker {
     while (this.frames.length && this.tick - this.frames[0]!.tick >= p.replayFrames) this.frames.shift();
 
     if (this.st === 'waiting') {
-      if (obs.calibration === 'calibrated' && this.startConfident(obs.vis)) {
+      // 'setup': vision accepted a starting position and fitted its (provisional) models on it; 'calibrated' only
+      // appears with a position hint, i.e. for a frame or two after a new game.
+      if ((obs.calibration === 'setup' || obs.calibration === 'calibrated') && this.startConfident(obs.vis)) {
         this.lockSince ??= obs.t;
         if (obs.t - this.lockSince >= p.lockHoldMs) {
           this.resetGame();
