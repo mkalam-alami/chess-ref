@@ -10,9 +10,9 @@ export interface CoverMap {
   offsetY: number;
 }
 
-/** Mapping for an element showing a frame with `object-fit: cover` in a viewport. */
+/** Mapping for an element showing a frame with `object-fit: contain` in a viewport. */
 export function coverMap(frameW: number, frameH: number, viewW: number, viewH: number): CoverMap {
-  const scale = Math.max(viewW / frameW, viewH / frameH);
+  const scale = Math.min(viewW / frameW, viewH / frameH);
   return {
     scale,
     offsetX: (viewW - frameW * scale) / 2,
@@ -20,8 +20,8 @@ export function coverMap(frameW: number, frameH: number, viewW: number, viewH: n
   };
 }
 
-/** The part of the frame shown in the viewport under `object-fit: cover`, [x0, y0, x1, y1] in frame coordinates
- *  (coverMap inverted on the viewport's corners, clamped to the frame). */
+/** The part of the frame shown in the viewport under `object-fit: contain`, [x0, y0, x1, y1] in frame coordinates
+ *  (coverMap inverted on the viewport's corners, clamped to the frame; the whole frame under `contain`). */
 export function visibleFrameRect(frameW: number, frameH: number, viewW: number, viewH: number): [number, number, number, number] {
   const m = coverMap(frameW, frameH, viewW, viewH);
   const cl = (v: number, hi: number) => Math.max(0, Math.min(hi, v));

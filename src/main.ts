@@ -477,7 +477,7 @@ async function pump(): Promise<void> {
     height: frame.height,
     params: getParams(),
     debugView: panel.visible ? panel.view : 'none',
-    // What the user sees of the frame (object-fit: cover). The sidebar is not subtracted: the board stays visible
+    // What the user sees of the frame (object-fit: contain). The sidebar is not subtracted: the board stays visible
     // through it.
     visibleRect: visibleFrameRect(frame.width, frame.height, window.innerWidth, window.innerHeight),
   };

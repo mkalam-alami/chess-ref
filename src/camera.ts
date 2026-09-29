@@ -1,6 +1,6 @@
 /** A displayable, drawable frame source (live camera or a looping file). */
 export interface FrameSource {
-  /** Element to mount in the page; sized by CSS with object-fit: cover. */
+  /** Element to mount in the page; sized by CSS with object-fit: contain. */
   readonly element: HTMLVideoElement | HTMLCanvasElement;
   /** Native size of the source in pixels (0 until known). */
   readonly width: number;

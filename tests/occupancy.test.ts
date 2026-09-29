@@ -93,7 +93,7 @@ describe('boardFramed', () => {
   it('checks against the visible rect, not the whole frame', () => {
     const { hb } = cam(20, 40, 560, 14);
     expect(framedFor(hb, full).framed).toBe(true);
-    // A portrait screen showing the middle of a landscape frame (object-fit: cover): the board's sides are cut off.
+    // A portrait screen showing the middle of a landscape frame (a cropped view): the board's sides are cut off.
     expect(framedFor(hb, [W / 2 - 0.3 * H, 0, W / 2 + 0.3 * H, H]).framed).toBe(false);
     expect(framedFor(hb, [0, 100, W, H]).framed).toBe(false);
   });

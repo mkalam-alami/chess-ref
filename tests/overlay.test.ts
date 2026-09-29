@@ -23,17 +23,14 @@ import { homographyFrom4, applyH, type Point } from '../src/geom/homography';
 import { OCC_BLACK, OCC_EMPTY, OCC_WHITE } from '../src/worker/protocol';
 
 describe('visibleFrameRect', () => {
-  it('is the whole frame when the aspect ratios match, and the centred crop otherwise', () => {
+  it('is always the whole frame (contain letterboxes instead of cropping)', () => {
     expect(visibleFrameRect(640, 360, 1280, 720)).toEqual([0, 0, 640, 360]);
-    // Wider viewport: rows cut at the top and bottom.
-    expect(visibleFrameRect(400, 400, 800, 400)).toEqual([0, 100, 400, 300]);
-    // Portrait phone on a landscape frame: only the middle columns are shown.
+    // Wider viewport: the frame is pillarboxed, still entirely visible.
+    expect(visibleFrameRect(400, 400, 800, 400)).toEqual([0, 0, 400, 400]);
+    // Portrait phone on a landscape frame: the whole frame is shown, letterboxed.
     const [x0, y0, x1, y1] = visibleFrameRect(1280, 720, 390, 780);
-    expect(y0).toBe(0);
-    expect(y1).toBe(720);
-    expect(x0).toBeCloseTo(640 - 180);
-    expect(x1).toBeCloseTo(640 + 180);
-    // Inverse of frameToScreen: the rect's corners land on the viewport's corners.
+    expect([x0, y0, x1, y1]).toEqual([0, 0, 1280, 720]);
+    // Inverse of frameToScreen: the rect's corners land inside the viewport.
     const m = coverMap(1280, 720, 390, 780);
     expect(frameToScreen([x0, y0], m)[0]).toBeCloseTo(0);
     expect(frameToScreen([x1, y1], m)[0]).toBeCloseTo(390);
@@ -47,20 +44,19 @@ describe('coverMap', () => {
     expect(frameToScreen([320, 180], m)).toEqual([640, 360]);
   });
 
-  it('crops vertically when the viewport is wider than the frame', () => {
-    const m = coverMap(400, 400, 800, 400);
-    expect(m.scale).toBe(2);
+  it('letterboxes vertically when the viewport is taller than the frame', () => {
+    const m = coverMap(400, 200, 200, 400);
+    expect(m.scale).toBe(0.5);
     expect(m.offsetX).toBe(0);
-    expect(m.offsetY).toBe(-200);
-    expect(frameToScreen([0, 100], m)).toEqual([0, 0]);
-    expect(frameToScreen([400, 300], m)).toEqual([800, 400]);
+    expect(m.offsetY).toBe(150);
+    expect(frameToScreen([400, 200], m)).toEqual([200, 250]);
   });
 
-  it('crops horizontally when the viewport is taller than the frame', () => {
-    const m = coverMap(400, 200, 200, 200);
+  it('pillarboxes horizontally when the viewport is wider than the frame', () => {
+    const m = coverMap(200, 200, 400, 200);
     expect(m.scale).toBe(1);
-    expect(m.offsetX).toBe(-100);
-    expect(frameToScreen([200, 100], m)).toEqual([100, 100]);
+    expect(m.offsetX).toBe(100);
+    expect(frameToScreen([200, 100], m)).toEqual([300, 100]);
   });
 });
 

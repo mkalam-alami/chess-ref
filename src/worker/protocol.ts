@@ -21,7 +21,7 @@ export interface FrameMessage {
   debugView: DebugView;
   /**
    * Part of the frame actually shown on screen, [x0, y0, x1, y1] in frame coordinates (the video is drawn with
-   * `object-fit: cover`, so the screen shows a crop of it). Absent: the whole frame counts as visible. Vision only
+   * `object-fit: contain`, so the screen shows all of it, letterboxed). Absent: the whole frame counts as visible. Vision only
    * counts a frame as evidence when the whole board is inside it (Observation.framed).
    */
   visibleRect?: [number, number, number, number];
