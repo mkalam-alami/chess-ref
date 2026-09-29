@@ -6,6 +6,8 @@ type Mat = InstanceType<CV['Mat']>;
 export interface TrackPreResult {
   /** CLAHE-L, a*, b* interleaved (8UC3). */
   labEq: Mat;
+  /** Interleaved channels in `labEq`: 3, or 1 (CLAHE-L only) for an L-only profile. */
+  stride: 1 | 3;
   /** Canny edges (8U, 0/255) of the CLAHE-L channel. */
   edges: Mat;
   timings: Record<string, number>;
@@ -58,7 +60,7 @@ export class TrackPreprocessor {
    * `roi` is the crop (in pixels of `rgba`) that contains the board plus a margin. `edges` is at the crop's size
    * (full resolution); `labEq` is at half the crop's size (the checker verification only needs cell medians).
    */
-  run(rgba: Mat, params: Params, roi: { x: number; y: number; w: number; h: number }): TrackPreResult {
+  run(rgba: Mat, params: Params, roi: { x: number; y: number; w: number; h: number }, lOnly = false): TrackPreResult {
     const cv = this.cv;
     const timings: Record<string, number> = {};
     let t = performance.now();
@@ -106,38 +108,23 @@ export class TrackPreprocessor {
 
       // Verification image: half resolution Lab with CLAHE on L.
       cv.resize(view, this.rgb, this.smallSize, 0, 0, cv.INTER_AREA);
-      cv.cvtColor(this.rgb, this.rgb, cv.COLOR_RGBA2RGB);
-      cv.cvtColor(this.rgb, this.lab, cv.COLOR_RGB2Lab);
-      cv.split(this.lab, this.channels);
       this.clahe.setClipLimit(param(params, PREPROCESS_PARAMS, 'claheClip'));
-      const l = this.channels.get(0);
-      try {
-        this.clahe.apply(l, this.lEq);
-      } finally {
-        l.delete();
-      }
-      const a = this.channels.get(1);
-      const b = this.channels.get(2);
-      const mv = new cv.MatVector();
-      try {
-        mv.push_back(this.lEq);
-        mv.push_back(a);
-        mv.push_back(b);
-        cv.merge(mv, this.labEq);
-      } finally {
-        a.delete();
-        b.delete();
-        mv.delete();
+      if (lOnly) {
+        cv.cvtColor(this.rgb, this.lab, cv.COLOR_RGBA2GRAY);
+        this.clahe.apply(this.lab, this.lEq);
+      } else {
+        cv.cvtColor(this.rgb, this.rgb, cv.COLOR_RGBA2RGB);
+        this.mergeLabEq();
       }
       lap('trackLab');
     } finally {
       view.delete();
     }
-    return { labEq: this.labEq, edges: this.edges, timings };
+    return { labEq: lOnly ? this.lEq : this.labEq, stride: lOnly ? 1 : 3, edges: this.edges, timings };
   }
 
   /** Full-frame variant: full-resolution Lab + CLAHE-L (used for both verification and edges). */
-  runFull(rgba: Mat, params: Params): TrackPreResult {
+  runFull(rgba: Mat, params: Params, lOnly = false): TrackPreResult {
     const cv = this.cv;
     const timings: Record<string, number> = {};
     let t = performance.now();
@@ -146,29 +133,13 @@ export class TrackPreprocessor {
       timings[name] = now - t;
       t = now;
     };
-    cv.cvtColor(rgba, this.rgb, cv.COLOR_RGBA2RGB);
-    cv.cvtColor(this.rgb, this.lab, cv.COLOR_RGB2Lab);
-    cv.split(this.lab, this.channels);
-    lap('lab');
     this.clahe.setClipLimit(param(params, PREPROCESS_PARAMS, 'claheClip'));
-    const l = this.channels.get(0);
-    try {
-      this.clahe.apply(l, this.lEq);
-    } finally {
-      l.delete();
-    }
-    const a = this.channels.get(1);
-    const b = this.channels.get(2);
-    const mv = new cv.MatVector();
-    try {
-      mv.push_back(this.lEq);
-      mv.push_back(a);
-      mv.push_back(b);
-      cv.merge(mv, this.labEq);
-    } finally {
-      a.delete();
-      b.delete();
-      mv.delete();
+    if (lOnly) {
+      cv.cvtColor(rgba, this.lab, cv.COLOR_RGBA2GRAY);
+      this.clahe.apply(this.lab, this.lEq);
+    } else {
+      cv.cvtColor(rgba, this.rgb, cv.COLOR_RGBA2RGB);
+      this.mergeLabEq();
     }
     lap('clahe');
     const pct = param(params, PREPROCESS_PARAMS, 'cannyPercentile');
@@ -203,7 +174,33 @@ export class TrackPreprocessor {
     lap('trackGradient');
     cv.Canny(this.chan, this.edges, high * 0.4, high);
     lap('trackCanny');
-    return { labEq: this.labEq, edges: this.edges, timings };
+    return { labEq: lOnly ? this.lEq : this.labEq, stride: lOnly ? 1 : 3, edges: this.edges, timings };
+  }
+
+  /** this.rgb (RGB) -> Lab, CLAHE on L, merged into labEq. */
+  private mergeLabEq(): void {
+    const cv = this.cv;
+    cv.cvtColor(this.rgb, this.lab, cv.COLOR_RGB2Lab);
+    cv.split(this.lab, this.channels);
+    const l = this.channels.get(0);
+    try {
+      this.clahe.apply(l, this.lEq);
+    } finally {
+      l.delete();
+    }
+    const a = this.channels.get(1);
+    const b = this.channels.get(2);
+    const mv = new cv.MatVector();
+    try {
+      mv.push_back(this.lEq);
+      mv.push_back(a);
+      mv.push_back(b);
+      cv.merge(mv, this.labEq);
+    } finally {
+      a.delete();
+      b.delete();
+      mv.delete();
+    }
   }
 
   dispose(): void {

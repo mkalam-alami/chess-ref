@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
+import { inferProfile } from '../src/vision/profile';
 import { Detector } from '../src/vision/detector';
 import type { CV } from '../src/vision/preprocess';
 import { TrackingSession } from '../src/worker/tracker';
@@ -36,6 +37,29 @@ describe('tracking on perturbed sequences', () => {
     }
     console.log(`tracking ${mean(trackMs).toFixed(1)} ms vs full ${mean(fullMs).toFixed(1)} ms`);
     expect(mean(fullMs) / mean(trackMs)).toBeGreaterThanOrEqual(3);
+  }, 120_000);
+
+  it('L-only profile tracking stays locked (<2% error) and is cheaper', () => {
+    const cases = realCases(cv, 640).filter((c) => c.gt);
+    const spec: SeqSpec = { frames: 12, jitter: 1, drift: 1, rotate: 0.1, noise: 1, seed: 5 };
+    const plain: number[] = [];
+    const lonly: number[] = [];
+    for (const c of cases) {
+      const first = det.detect(img(c), {});
+      if (!first.corners) continue;
+      const profile = inferProfile(first);
+      if (profile?.channels.length !== 1 || profile.channels[0] !== 0) continue;
+      const frames = makeSequence(cv, c.rgba, c.width, c.height, c.gt!, spec);
+      plain.push(...runSequence(det, frames, c.width, c.height, { trackFullEvery: 0 }).trackMs);
+      const o = runSequence(det, frames, c.width, c.height, { trackFullEvery: 0 }, 66, { profile });
+      o.errs.forEach((e) => {
+        expect(e).not.toBeNull();
+        expect(e!).toBeLessThan(0.02);
+      });
+      lonly.push(...o.trackMs);
+    }
+    expect(lonly.length).toBeGreaterThan(0);
+    console.log(`tracking no-profile ${mean(plain).toFixed(1)} ms vs L-only profile ${mean(lonly).toFixed(1)} ms`);
   }, 120_000);
 
   it('falls back to full detection periodically', () => {

@@ -3,7 +3,7 @@ import { mulberry32 } from '../../src/geom/vanishing';
 import type { CV } from '../../src/vision/preprocess';
 import type { Params } from '../../src/worker/protocol';
 import { TrackingSession, type SessionResult } from '../../src/worker/tracker';
-import type { Detector } from '../../src/vision/detector';
+import type { DetectOptions, Detector } from '../../src/vision/detector';
 import { cornerError, type Quad } from './bench';
 
 export interface SeqSpec {
@@ -83,7 +83,7 @@ export interface SeqOutcome {
 const asImage = (rgba: Uint8ClampedArray, W: number, H: number) => ({ data: rgba, width: W, height: H }) as unknown as ImageData;
 
 /** Runs frames through the tracking state machine (frame i is "time" i * dtMs). */
-export function runSequence(det: Detector, frames: SeqFrame[], W: number, H: number, params: Params = {}, dtMs = 66): SeqOutcome {
+export function runSequence(det: Detector, frames: SeqFrame[], W: number, H: number, params: Params = {}, dtMs = 66, opts: DetectOptions = {}): SeqOutcome {
   const session = new TrackingSession(det);
   const results: SessionResult[] = [];
   const errs: (number | null)[] = [];
@@ -91,7 +91,7 @@ export function runSequence(det: Detector, frames: SeqFrame[], W: number, H: num
   const fullMs: number[] = [];
   frames.forEach((f, i) => {
     const t = performance.now();
-    const r = session.process(asImage(f.rgba, W, H), W, H, params, {}, i * dtMs);
+    const r = session.process(asImage(f.rgba, W, H), W, H, params, opts, i * dtMs);
     const ms = performance.now() - t;
     results.push(r);
     errs.push(r.corners ? cornerError(r.corners, f.gt) : null);

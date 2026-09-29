@@ -334,10 +334,12 @@ export class Detector {
     const y1 = Math.min(height, Math.ceil(Math.max(...pq.map((p) => p[1])) + margin));
     const useRoi = param(params, TRACK_PARAMS, 'trackRoi') > 0;
     const roi = useRoi ? { x: x0, y: y0, w: (x1 - x0) & ~1, h: (y1 - y0) & ~1 } : { x: 0, y: 0, w: width, h: height };
-    const pre = useRoi ? this.trackPre.run(rgba, params, roi) : this.trackPre.runFull(rgba, params);
+    const ch = opts.profile?.channels;
+    const lOnly = !!ch && ch.length === 1 && ch[0] === 0;
+    const pre = useRoi ? this.trackPre.run(rgba, params, roi, lOnly) : this.trackPre.runFull(rgba, params, lOnly);
     Object.assign(timings, pre.timings);
     t = performance.now();
-    const lab: Lab3 = { data: pre.labEq.data, width: useRoi ? roi.w >> 1 : width, height: useRoi ? roi.h >> 1 : height };
+    const lab: Lab3 = { data: pre.labEq.data, width: useRoi ? roi.w >> 1 : width, height: useRoi ? roi.h >> 1 : height, stride: pre.stride };
     const fail = (reason: string, prevScore = 0, edgeDist = 0): DetectResult => {
       timings.total = performance.now() - t0;
       return { corners: null, confidence: 0, timings, track: { prevScore, edgeDist, reason } };
