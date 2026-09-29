@@ -189,7 +189,7 @@ function listImages(dirs: string[], holdout: string | undefined, filter: string 
 // ---------------------------------------------------------------------------------------------------------------
 // Geometry
 
-const BOARD: Point[] = [[0, 0], [8, 0], [8, 8], [0, 8]];
+export const BOARD: Point[] = [[0, 0], [8, 0], [8, 8], [0, 8]];
 
 /** Mean and max corner error (fraction of the GT diagonal) over the best of the 8 corner assignments (by mean). */
 export function cornerErrors(det: readonly Point[], gt: readonly Point[]): { mean: number; max: number } {
@@ -241,7 +241,7 @@ const darkSquare = (sq: number) => ((sq & 7) + (sq >> 3)) % 2 === 0;
 
 const emptyConf = (): Confusion => [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
 
-function runTracker(frame: { data: Uint8ClampedArray; width: number; height: number }, hb: Mat3, params: Params, orient: Uint8Array | null, aligned: boolean): { r: RunResult; out: OccupancyResult; truthCells: Uint8Array | null } {
+export function runTracker(frame: { data: Uint8ClampedArray; width: number; height: number }, hb: Mat3, params: Params, orient: Uint8Array | null, aligned: boolean): { r: RunResult; out: OccupancyResult; truthCells: Uint8Array | null } {
   const tr = new OccupancyTracker();
   const maxMs = param(params, OCCUPANCY_PARAMS, 'occFallbackMs') + 5 * FRAME_MS;
   let out: OccupancyResult;
@@ -324,11 +324,13 @@ const FONT: Record<string, string> = {
   '/': '00001 00010 00010 00100 01000 01000 10000', '>': '01000 00100 00010 00001 00010 00100 01000',
   '=': '00000 00000 11111 00000 11111 00000 00000', '_': '00000 00000 00000 00000 00000 00000 11111',
   '(': '00010 00100 01000 01000 01000 00100 00010', ')': '01000 00100 00010 00010 00010 00100 01000',
+  '+': '00000 00100 00100 11111 00100 00100 00000', ',': '00000 00000 00000 00000 01100 00100 01000',
+  '?': '01110 10001 00001 00010 00100 00000 00100',
 };
 
-type RGB = readonly [number, number, number];
+export type RGB = readonly [number, number, number];
 
-class Canvas {
+export class Canvas {
   constructor(readonly img: Uint8ClampedArray, readonly w: number, readonly h: number) {}
 
   px(x: number, y: number, c: RGB, a = 1): void {
@@ -390,12 +392,12 @@ class Canvas {
   }
 }
 
-const GREEN: RGB = [0, 230, 0];
-const RED: RGB = [255, 40, 40];
-const YELLOW: RGB = [255, 220, 0];
-const CYAN: RGB = [0, 230, 255];
-const WHITE: RGB = [255, 255, 255];
-const BLACK: RGB = [0, 0, 0];
+export const GREEN: RGB = [0, 230, 0];
+export const RED: RGB = [255, 40, 40];
+export const YELLOW: RGB = [255, 220, 0];
+export const CYAN: RGB = [0, 230, 255];
+export const WHITE: RGB = [255, 255, 255];
+export const BLACK: RGB = [0, 0, 0];
 
 interface Decoded {
   data: Uint8Array;
@@ -403,7 +405,7 @@ interface Decoded {
   height: number;
 }
 
-function resizeRgba(cv: CV, img: Decoded, longSide: number): { data: Uint8ClampedArray; width: number; height: number } {
+export function resizeRgba(cv: CV, img: Decoded, longSide: number): { data: Uint8ClampedArray; width: number; height: number } {
   const scale = Math.min(1, longSide / Math.max(img.width, img.height));
   const w = Math.round(img.width * scale);
   const h = Math.round(img.height * scale);
@@ -423,7 +425,7 @@ function resizeRgba(cv: CV, img: Decoded, longSide: number): { data: Uint8Clampe
 const scalePts = (q: readonly Point[], s: number): Point[] => q.map(([x, y]) => [x * s, y * s] as Point);
 
 /** GT annotation overlay: 8x8 grid from the GT corners, a1/h1/h8/a8, the white edge, corner indices. */
-function drawGrid(cv: Canvas, gt: readonly Point[], whiteEdge: number | null, title: string): void {
+export function drawGrid(cv: Canvas, gt: readonly Point[], whiteEdge: number | null, title: string): void {
   const u = Math.max(1, Math.round(Math.max(cv.w, cv.h) / 800));
   const H = homographyFrom4(BOARD, gt)!;
   for (let k = 1; k < 8; k++) {
