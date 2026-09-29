@@ -100,7 +100,11 @@ class Sim {
   readonly rand: () => number;
   readonly game: GameTracker;
 
-  constructor(params: Partial<GameParams> = {}, seed = 1) {
+  constructor(
+    params: Partial<GameParams> = {},
+    seed = 1,
+    readonly frameMs = FRAME_MS,
+  ) {
     this.game = new GameTracker(params);
     this.rand = rng(seed);
   }
@@ -108,7 +112,7 @@ class Sim {
   /** Feeds frames for `ms`; returns the events of this call. */
   feed(ms: number, make: (t: number) => Observation): GameEvent[] {
     const out: GameEvent[] = [];
-    for (const end = this.t + ms; this.t < end; this.t += FRAME_MS) out.push(...this.game.observe(make(this.t)));
+    for (const end = this.t + ms; this.t < end; this.t += this.frameMs) out.push(...this.game.observe(make(this.t)));
     this.events.push(...out);
     return out;
   }
@@ -237,9 +241,11 @@ describe('GameTracker moves', () => {
     expect(sim.hand(2000, gridAfter('e4'))).toEqual([]);
     expect(sim.hand(1000)).toEqual([]);
     expect(sim.show(START_GRID, 1000)).toEqual([]);
-    // Interleaved hand frames break the dwell, so a move needs a clean hold.
-    for (let i = 0; i < 10; i++) {
-      expect(sim.show(gridAfter('e4'), 300)).toEqual([]);
+    // Interleaved hand frames break the dwell and the fast-path streak, so a move needs consecutive clean frames: with
+    // single stable frames between hand frames, neither the hold nor the 2-frame fast path can ever complete. (This
+    // used to show 300 ms glimpses against the 400 ms hold; a clean 300 ms is now enough evidence to commit on its own.)
+    for (let i = 0; i < 20; i++) {
+      expect(sim.show(gridAfter('e4'), FRAME_MS)).toEqual([]);
       sim.hand(100);
     }
     expect(sim.show(gridAfter('e4'), 1000).map((e) => e.type)).toEqual(['move']);
@@ -531,3 +537,213 @@ describe('GameTracker performance', () => {
   });
 });
 
+
+describe('GameTracker latency (10 detections/s)', () => {
+  const MS = 100;
+  interface Scenario {
+    name: string;
+    /** Committed line before the move. */
+    before: string[];
+    move: string;
+    occluded?: string[];
+  }
+  const SCENARIOS: Scenario[] = [
+    { name: 'clean move', before: [], move: 'e4' },
+    { name: 'occluded far rank', before: ['e4'], move: 'e5', occluded: ['a8', 'b8', 'c8', 'd8', 'e8', 'f8', 'g8', 'h8', 'e7'] },
+    { name: 'capture', before: ['e4', 'd5'], move: 'exd5' },
+    { name: 'castling', before: ['e4', 'e5', 'Nf3', 'Nc6', 'Bc4', 'Bc5'], move: 'O-O' },
+  ];
+
+  /** A saved game (GameTracker.save format) at the end of a SAN line: skips the lock-in. */
+  function savedGame(line: string[]): string {
+    const c = new Chess();
+    for (const m of line) c.move(m);
+    return JSON.stringify({ format: 'chess-ref-game', v: 1, state: 'playing', moves: c.history({ verbose: true }).map((m) => m.lan) });
+  }
+
+  /** The pre-change tuning (400 ms hold, no fast path, hands fade evidence like stable frames), for comparison. */
+  const BEFORE: Partial<GameParams> = { moveHoldMs: 400, fastMargin: Infinity, unstableDecay: 0.85 };
+
+  /** A tracker at `s.before`, with that position observed for 2 s, then `unstable` hand/settle frames. */
+  function setup(s: Scenario, seed: number, unstable: number, params: Partial<GameParams> = {}): Sim {
+    const sim = new Sim(params, seed, MS);
+    expect(sim.game.load(savedGame(s.before))).toBe(true);
+    sim.show(gridAfter(...s.before), 2000, { occluded: s.occluded });
+    expect(sim.sans()).toEqual(s.before);
+    expect(sim.hand(unstable * MS)).toEqual([]);
+    return sim;
+  }
+
+  /**
+   * Stable frames from the hand leaving (after `unstable` hand/settle frames) to the commit of `s.move`, the frame of
+   * the commit included; Infinity when it doesn't commit within 3 s. Checks that nothing else is committed.
+   */
+  function latency(s: Scenario, seed: number, unstable = 6, params: Partial<GameParams> = {}, o: ObsOpts = {}): { frames: number; sim: Sim } {
+    const sim = setup(s, seed, unstable, params);
+    const target = gridAfter(...s.before, s.move);
+    for (let f = 1; f <= 30; f++) {
+      const ev = sim.show(target, MS, { occluded: s.occluded, ...o });
+      if (ev.length) {
+        expect(ev.map((e) => e.type)).toEqual(['move']);
+        expect(sim.sans()).toEqual([...s.before, s.move]);
+        return { frames: f, sim };
+      }
+    }
+    return { frames: Infinity, sim };
+  }
+
+  const SEEDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  /** Hand + settle frames before the move is seen (400 ms settle alone is 4). */
+  const HANDS = [4, 6, 10];
+  const WEAK: ObsOpts = { probs: { e2: [0.65, 0.24, 0.11], e4: [0.24, 0.65, 0.11] } };
+
+  it('commits a clean move within 3 stable frames after the hand; reports before/after latency', () => {
+    const med = (a: number[]) => [...a].sort((x, y) => x - y)[a.length >> 1]!;
+    for (const s of SCENARIOS) {
+      for (const n of HANDS) {
+        const after = SEEDS.map((seed) => latency(s, seed, n).frames);
+        const before = SEEDS.map((seed) => latency(s, seed, n, BEFORE).frames);
+        console.log(`latency ${s.name}, ${n} unstable frames: before median ${med(before)} max ${Math.max(...before)} [${before.join(' ')}], after median ${med(after)} max ${Math.max(...after)} [${after.join(' ')}] stable frames`);
+        expect(Math.max(...after)).toBeLessThan(Infinity);
+        expect(med(after)).toBeLessThan(med(before));
+        if (s.name !== 'occluded far rank') {
+          // Clean evidence: 3 stable frames at most, except when the synthetic 2 % per-cell misread hits one of the
+          // move's cells on a deciding frame (that frame isn't decisive, and the fast streak restarts).
+          expect(med(after)).toBeLessThanOrEqual(3);
+          expect(after.filter((f) => f <= 3).length).toBeGreaterThanOrEqual(SEEDS.length - 2);
+          expect(Math.max(...after)).toBeLessThanOrEqual(5);
+        }
+      }
+    }
+  });
+
+  it('a marginal move (weak contrast on its cells) still commits, through the hold', () => {
+    for (const seed of SEEDS.slice(0, 4)) {
+      const { frames, sim } = latency(SCENARIOS[0]!, seed, 6, {}, WEAK);
+      expect(frames).toBeGreaterThan(3);
+      expect(frames).toBeLessThan(Infinity);
+      const tm = sim.game.snapshot().lastTiming!;
+      expect(tm.kind).toBe('advance');
+      expect(tm.committedAt - tm.favouriteAt).toBeGreaterThanOrEqual(sim.game.params.moveHoldMs);
+    }
+  });
+
+  it('near-equal alternating evidence switches at most once', () => {
+    const lean = (which: 'e' | 'd'): Record<string, [number, number, number]> => {
+      const em: [number, number, number] = [0.65, 0.24, 0.11];
+      const wh: [number, number, number] = [0.24, 0.65, 0.11];
+      return which === 'e' ? { e2: em, e4: wh, d2: wh, d4: em } : { e2: wh, e4: em, d2: em, d4: wh };
+    };
+    for (const seed of [1, 2, 3]) {
+      const sim = new Sim({}, seed, MS);
+      expect(sim.game.load(savedGame([]))).toBe(true);
+      sim.show(START_GRID, 2000);
+      const r = rng(seed * 17);
+      sim.feed(10000, (t) => observation(START_GRID, t, sim.rand, { probs: lean(r() < 0.5 ? 'e' : 'd') }));
+      expect(count(sim.events, 'move') + count(sim.events, 'revised')).toBeLessThanOrEqual(1);
+      const alt = new Sim({}, seed, MS);
+      expect(alt.game.load(savedGame([]))).toBe(true);
+      alt.show(START_GRID, 2000);
+      for (const phase of ['e', 'd', 'e', 'd'] as const) alt.show(START_GRID, 2000, { probs: lean(phase) });
+      expect(count(alt.events, 'move')).toBe(1);
+      expect(count(alt.events, 'revised')).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('commits nothing during unstable frames, however clear they look', () => {
+    for (const seed of [1, 2]) {
+      const sim = setup(SCENARIOS[0]!, seed, 0);
+      expect(sim.hand(3000, gridAfter('e4'))).toEqual([]);
+      expect(sim.game.snapshot().pending).toBeNull();
+      // Single clean frames between hand frames: no 2-frame streak, no hold.
+      for (let i = 0; i < 20; i++) {
+        expect(sim.show(gridAfter('e4'), MS)).toEqual([]);
+        expect(sim.hand(2 * MS, gridAfter('e4'))).toEqual([]);
+      }
+      expect(sim.show(gridAfter('e4'), 3 * MS).map((e) => e.type)).toEqual(['move']);
+    }
+  });
+
+  it('snapshot().pending follows the challenger until the commit', () => {
+    const sim = setup(SCENARIOS[0]!, 3, 6);
+    expect(sim.game.snapshot().pending).toBeNull();
+    const progress: number[] = [];
+    for (let f = 0; f < 40 && sim.sans().length === 0; f++) {
+      sim.show(gridAfter('e4'), MS, WEAK);
+      const p = sim.game.snapshot().pending;
+      if (sim.sans().length) expect(p).toBeNull();
+      else if (p) {
+        expect(p.kind).toBe('advance');
+        expect(p.fromPly).toBe(0);
+        expect(p.plies).toEqual([{ san: 'e4', from: sqIndex('e2'), to: sqIndex('e4'), tentative: true }]);
+        progress.push(p.progress);
+      }
+    }
+    expect(sim.sans()).toEqual(['e4']);
+    expect(progress.length).toBeGreaterThan(2);
+    for (const x of progress) {
+      expect(x).toBeGreaterThanOrEqual(0);
+      expect(x).toBeLessThanOrEqual(1);
+    }
+    expect(progress[progress.length - 1]!).toBeGreaterThan(progress[0]!);
+    // Incumbent favoured: no pending change.
+    sim.show(gridAfter('e4'), 1000);
+    expect(sim.game.snapshot().pending).toBeNull();
+    // A takeback in progress: a shorter line (nothing replaces ply 0).
+    sim.hand(600);
+    let seen = false;
+    for (let f = 0; f < 30 && sim.sans().length === 1; f++) {
+      sim.show(START_GRID, MS);
+      const p = sim.game.snapshot().pending;
+      if (p && sim.sans().length === 1) {
+        expect(p.kind).toBe('takeback');
+        expect(p.fromPly).toBe(0);
+        expect(p.plies).toEqual([]);
+        seen = true;
+      }
+    }
+    expect(seen).toBe(true);
+    expect(sim.sans()).toEqual([]);
+    expect(sim.game.snapshot().lastTiming!.kind).toBe('takeback');
+  });
+
+  it('snapshot().lastTiming records the hand, the favourite and the commit', () => {
+    const s = SCENARIOS[2]!;
+    const sim = setup(s, 5, 6);
+    const handEnd = sim.t - MS;
+    const firstStable = sim.t;
+    const after = gridAfter(...s.before, s.move);
+    sim.show(after, 1000);
+    const tm = sim.game.snapshot().lastTiming!;
+    expect(tm.kind).toBe('advance');
+    expect(tm.unstableEndAt).toBe(handEnd);
+    expect(tm.stableAt).toBe(firstStable);
+    expect(tm.favouriteAt).toBeGreaterThanOrEqual(firstStable);
+    expect(tm.committedAt).toBeGreaterThanOrEqual(tm.favouriteAt);
+    expect(tm.committedAt - firstStable).toBeLessThanOrEqual(2 * MS);
+    // Kept through later observations, including hands.
+    sim.hand(500);
+    sim.show(after, 1000);
+    expect(sim.game.snapshot().lastTiming).toEqual(tm);
+    // A commit without a preceding hand has no hand times.
+    const noHand = setup(SCENARIOS[0]!, 6, 0);
+    expect(noHand.game.snapshot().lastTiming).toBeNull();
+    noHand.show(gridAfter('e4'), 1000);
+    const t2 = noHand.game.snapshot().lastTiming!;
+    expect(t2.stableAt).toBeNull();
+    expect(t2.unstableEndAt).toBeNull();
+  });
+
+  it('snapshot() is cheap enough to call on every frame', () => {
+    const line = ['e4', 'e5', 'Nf3', 'Nc6', 'Bb5', 'a6', 'Ba4', 'Nf6', 'O-O', 'Be7'];
+    const sim = new Sim({}, 9, MS);
+    expect(sim.game.load(savedGame(line))).toBe(true);
+    sim.show(gridAfter(...line, 'Re1'), 200);
+    const n = 10000;
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) sim.game.snapshot();
+    const us = ((performance.now() - t0) / n) * 1000;
+    console.log(`snapshot(): ${us.toFixed(1)} µs/call`);
+    expect(us).toBeLessThan(100);
+  });
+});

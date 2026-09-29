@@ -1,7 +1,7 @@
 import { Chess, type Move } from 'chess.js';
 import { gridOf, piecesOf, sqIndex, START_FEN, START_GRID, uciMove } from './board';
 import { Lattice, type EvidenceFrame, type HNode } from './lattice';
-import type { GameEvent, GameSnapshot, GameState, Observation, PlyInfo } from './types';
+import type { ChangeTiming, GameEvent, GameSnapshot, GameState, Observation, PendingChange, PlyInfo } from './types';
 
 /**
  * Tunables of the game layer (thresholds in summed log-likelihood units, times in ms of observation clock).
@@ -10,14 +10,29 @@ import type { GameEvent, GameSnapshot, GameState, Observation, PlyInfo } from '.
  * leaky sum (decay 0.85) a sustained difference is worth about 6.7× its per-frame value. A clean quiet move (2 cells)
  * therefore builds a margin of ~5–7 per frame, ~35–45 in steady state; a single-cell glitch can't be explained by any
  * legal move (every move changes at least 2 cells), so it never raises a hypothesis by itself.
+ *
+ * Latency (at ~10 frames/s): a change commits either
+ * - on the **hold path**: margin τ over the incumbent (and τ_amb over the runner-up) held continuously for t_hold, which
+ *   is what marginal evidence (occluded cells, weak contrast) goes through; or
+ * - on the **fast path**: the same margins, plus `fastFrames` consecutive stable frames on each of which that frame's
+ *   own evidence favours the challenger over the incumbent and over the runner-up by `fastMargin` (scaled like τ for
+ *   revisions, takebacks and cooldown). A clean move (~5–7 per frame) qualifies; weak or contradictory evidence (the
+ *   near-equal flicker case, ~2 per frame) never does, so the dwell time only guards the cases it was made for.
+ * Wrong fast commits are what the revision window is for. Evidence from before a hand fades by `unstableDecay` per
+ * unstable frame, so a move made under the hand doesn't first have to pay back the stale lead of the old position.
  */
 export interface GameParams {
   /** Revision window: number of most recent plies that stay correctable (1 by default, 2 supported). */
   revisionDepth: number;
   /** Beam width B: nodes per inner level of the lattice whose children are expanded. */
   beamWidth: number;
-  /** Leaky-sum factor λ per frame (also the unstable-frame decay). */
+  /** Leaky-sum factor λ per stable frame. */
   decay: number;
+  /**
+   * Fading of every score per unstable frame (hand, freeze, dropped). Evidence from before a hand describes a board
+   * that may have changed under it; with 0.5, 4 unstable frames (the vision settle alone) keep ~6 % of it.
+   */
+  unstableDecay: number;
   /** Prior cost per ply of edit distance to the committed line (shorter explanations win ties). */
   plyPenalty: number;
   /** Incumbent (committed tip) bonus β: challengers must beat incumbent + β. */
@@ -26,6 +41,14 @@ export interface GameParams {
   moveMargin: number;
   /** t_hold: an advance must stay the qualified argmax this long (stable frames, continuously). */
   moveHoldMs: number;
+  /**
+   * Fast path: per-frame evidence (one frame's log-likelihood difference) the challenger needs over the incumbent and
+   * over the runner-up, on `fastFrames` consecutive stable frames, to commit without the hold (advance; scaled by
+   * τ_revise / τ_move for revisions and takebacks, and doubled again under cooldown). Infinity disables the fast path.
+   */
+  fastMargin: number;
+  /** Fast path: consecutive stable frames of decisive evidence (the commit frame included). */
+  fastFrames: number;
   /** τ_revise: margin for a revision (the line diverges inside the window) or a takeback (a shorter line). */
   reviseMargin: number;
   /** t_revise: dwell for revisions and takebacks. */
@@ -66,10 +89,13 @@ export const DEFAULT_GAME_PARAMS: GameParams = {
   revisionDepth: 1,
   beamWidth: 6,
   decay: 0.85,
+  unstableDecay: 0.5,
   plyPenalty: 1,
   incumbentBonus: 2,
   moveMargin: 8,
-  moveHoldMs: 400,
+  moveHoldMs: 250,
+  fastMargin: 4,
+  fastFrames: 2,
   reviseMargin: 16,
   reviseHoldMs: 800,
   ambiguityMargin: 4,
@@ -162,6 +188,22 @@ export class GameTracker {
   private resyncSince: number | null = null;
   private dwellKey: string | null = null;
   private dwellSince = 0;
+  /** Fast path: challenger with decisive per-frame evidence on the last `fastCount` consecutive stable frames. */
+  private fastKey: string | null = null;
+  private fastCount = 0;
+  /** Decay clock of the leaky sums (see EvidenceFrame.age). */
+  private age = 0;
+  /** Challenger leading the incumbent but not committed (null otherwise), with its progress; plies built on demand. */
+  private pendingNode: HNode | null = null;
+  private pendingProgress = 0;
+  /** Timing trail (observation clock) for ChangeTiming. */
+  private unstableAt: number | null = null;
+  private stableAt: number | null = null;
+  private favKey: string | null = null;
+  private favSince = 0;
+  private timing: ChangeTiming | null = null;
+  /** snapshot() parts that only change with the committed game (dropped by rebuild / resetGame). */
+  private cache: (Pick<GameSnapshot, 'fen' | 'turn' | 'check' | 'result' | 'plies' | 'pieces' | 'lastMove' | 'grid'> & { waiting: boolean }) | null = null;
 
   constructor(params: Partial<GameParams> = {}) {
     this.params = { ...DEFAULT_GAME_PARAMS, ...params };
@@ -187,17 +229,24 @@ export class GameTracker {
     let stable = obs.stable;
     if (stable) for (let i = 0; i < 192; i++) if (!Number.isFinite(obs.logLik[i]!)) stable = false;
     if (!stable) {
+      this.age += this.unstableAge();
       this.lattice?.decayOnly();
-      this.dwellKey = null;
+      this.dwellKey = this.fastKey = this.favKey = null;
+      this.pendingNode = null;
       this.lockSince = null;
       this.newGameSince = null;
+      this.unstableAt = obs.t;
+      this.stableAt = null;
       return [];
     }
+    this.age += 1;
+    if (this.unstableAt !== null) this.stableAt ??= obs.t;
+    this.pendingNode = null;
 
     const L = obs.logLik;
     const lam = p.decay;
     for (let i = 0; i < 192; i++) this.mean[i] = lam * this.mean[i]! + (1 - lam) * L[i]!;
-    this.frames.push({ logLik: L.slice(0, 192), tick: this.tick });
+    this.frames.push({ logLik: L.slice(0, 192), tick: this.tick, age: this.age });
     while (this.frames.length && this.tick - this.frames[0]!.tick >= p.replayFrames) this.frames.shift();
 
     if (this.st === 'waiting') {
@@ -214,7 +263,7 @@ export class GameTracker {
     }
 
     const lat = this.lattice!;
-    lat.setFrames(this.frames, this.tick);
+    lat.setFrames(this.frames, this.age);
     lat.update(L);
     lat.refreshEff();
     lat.maintain(this.tick);
@@ -242,7 +291,7 @@ export class GameTracker {
           if (obs.t - this.resyncSince >= p.resyncMs) {
             this.st = 'playing';
             this.desyncSince = this.resyncSince = null;
-            this.dwellKey = null;
+            this.dwellKey = this.fastKey = null;
             events.push({ type: 'resynced' });
           }
         } else this.resyncSince = null;
@@ -251,7 +300,7 @@ export class GameTracker {
         if (obs.t - this.desyncSince >= p.desyncMs) {
           this.st = 'desync';
           this.resyncSince = null;
-          this.dwellKey = null;
+          this.dwellKey = this.fastKey = null;
           return [{ type: 'desync' }];
         }
       } else this.desyncSince = null;
@@ -261,42 +310,82 @@ export class GameTracker {
     // Commit decision.
     const inc = lat.incumbent;
     if (best === inc) {
-      this.dwellKey = null;
+      this.dwellKey = this.fastKey = this.favKey = null;
       return events;
+    }
+    if (this.favKey !== best.key) {
+      this.favKey = best.key;
+      this.favSince = obs.t;
     }
     const margin = best.eff - inc.eff;
     const amb = runnerUp ? best.eff - runnerUp.eff : Infinity;
     const advance = best.kind === 'advance';
     let need = advance ? p.moveMargin : p.reviseMargin;
     if (!advance && this.inCooldown(best.common, obs.t)) need = Math.max(need, 2 * p.reviseMargin + 1e-9);
+    const hold = advance ? p.moveHoldMs : p.reviseHoldMs;
+
+    // Fast-path streak: this frame's own evidence is decisive against the incumbent and the runner-up.
+    const fastNeed = (p.fastMargin * need) / p.moveMargin;
+    const frameLead = Math.min(best.gain - inc.gain, runnerUp ? best.gain - runnerUp.gain : Infinity);
+    if (frameLead >= fastNeed) {
+      if (this.fastKey !== best.key) {
+        this.fastKey = best.key;
+        this.fastCount = 0;
+      }
+      this.fastCount++;
+    } else this.fastKey = null;
+
     if (margin < need || amb < p.ambiguityMargin) {
       this.dwellKey = null;
+      this.setPending(best, margin / need);
       return events;
     }
     if (this.dwellKey !== best.key) {
       this.dwellKey = best.key;
       this.dwellSince = obs.t;
     }
-    if (obs.t - this.dwellSince < (advance ? p.moveHoldMs : p.reviseHoldMs)) return events;
+    const fast = this.fastKey === best.key && this.fastCount >= p.fastFrames;
+    if (!fast && obs.t - this.dwellSince < hold) {
+      this.setPending(best, Math.max(margin / need, (obs.t - this.dwellSince) / hold));
+      return events;
+    }
     events.push(...this.commit(best, obs.t));
     return events;
   }
 
+  /**
+   * Current state for display. Cheap enough to call on every frame: what only changes on commits (position, plies,
+   * pieces, grid) is computed once per change and copied; only `pending` and `top` are built per call.
+   */
   snapshot(): GameSnapshot {
     const waiting = this.st === 'waiting';
-    const last = this.plies[this.plies.length - 1];
+    let c = this.cache;
+    if (!c || c.waiting !== waiting) {
+      const last = this.plies[this.plies.length - 1];
+      c = this.cache = {
+        waiting,
+        fen: this.chess.fen(),
+        turn: this.chess.turn(),
+        check: this.chess.inCheck(),
+        result: resultOf(this.chess),
+        plies: this.plies.map((q) => ({ ...q })),
+        pieces: waiting ? new Array(64).fill(null) : piecesOf(this.chess),
+        lastMove: last ? { from: last.from, to: last.to } : null,
+        grid: waiting ? null : gridOf(this.chess),
+      };
+    }
     return {
       state: this.st,
-      fen: this.chess.fen(),
-      turn: this.chess.turn(),
-      check: this.chess.inCheck(),
-      result: resultOf(this.chess),
-      plies: this.plies.map((q) => ({ ...q })),
-      pieces: waiting ? new Array(64).fill(null) : piecesOf(this.chess),
-      lastMove: last ? { from: last.from, to: last.to } : null,
-      grid: waiting ? null : gridOf(this.chess),
-      pending: null,
-      lastTiming: null,
+      fen: c.fen,
+      turn: c.turn,
+      check: c.check,
+      result: c.result,
+      plies: c.plies.map((q) => ({ ...q })),
+      pieces: c.pieces.slice(),
+      lastMove: c.lastMove ? { ...c.lastMove } : null,
+      grid: c.grid ? c.grid.slice() : null,
+      pending: this.pending(),
+      lastTiming: this.timing ? { ...this.timing } : null,
       top: this.lattice && !waiting ? this.lattice.top(3).map((n) => ({ line: n.line(), score: n.eff })) : [],
     };
   }
@@ -317,6 +406,7 @@ export class GameTracker {
   /** Drops the game and waits for the starting position again. */
   newGame(): void {
     this.resetGame();
+    this.timing = null;
     this.st = 'waiting';
     this.lattice = null;
   }
@@ -416,12 +506,39 @@ export class GameTracker {
     this.uci = [];
     this.plies = [];
     this.finalCount = 0;
+    this.cache = null;
     this.resetTimers();
   }
 
   private resetTimers(): void {
     this.lockSince = this.newGameSince = this.desyncSince = this.resyncSince = null;
-    this.dwellKey = null;
+    this.dwellKey = this.fastKey = this.favKey = null;
+    this.pendingNode = null;
+  }
+
+  private setPending(node: HNode, progress: number): void {
+    this.pendingNode = node;
+    this.pendingProgress = Number.isFinite(progress) ? Math.min(1, Math.max(0, progress)) : 1;
+  }
+
+  /** Decay-clock advance of one unstable frame: decay^this = unstableDecay. */
+  private unstableAge(): number {
+    const lam = this.params.decay;
+    const u = Math.min(1, Math.max(1e-6, this.params.unstableDecay));
+    return lam > 0 && lam < 1 ? Math.log(u) / Math.log(lam) : 1;
+  }
+
+  /** The pending change (see GameSnapshot.pending), built on demand from the stored challenger. */
+  private pending(): PendingChange | null {
+    const n = this.pendingNode;
+    if (!n || n.kind === 'incumbent' || this.st === 'waiting' || this.st === 'desync') return null;
+    const plies: PlyInfo[] = [];
+    for (let m: HNode | null = n; m && m.spec && m.depth > n.common; m = m.parent) {
+      const q: PlyInfo = { san: m.spec.san, from: m.spec.from, to: m.spec.to, tentative: true };
+      if (m.spec.promotion) q.promotion = m.spec.promotion;
+      plies.push(q);
+    }
+    return { kind: n.kind, fromPly: this.finalCount + n.common, plies: plies.reverse(), progress: this.pendingProgress };
   }
 
   /** Rebuilds the lattice at the current anchor; scores come back from the replay buffer. */
@@ -436,13 +553,16 @@ export class GameTracker {
       maxDepth: this.params.revisionDepth + 1,
       beam: Math.max(1, this.params.beamWidth),
       decay: this.params.decay,
+      unstableDecay: Math.min(1, Math.max(1e-6, this.params.unstableDecay)),
       plyPenalty: this.params.plyPenalty,
       incumbentBonus: this.params.incumbentBonus,
       collapseAfter: this.params.collapseAfterFrames,
       maxExpansions: Math.max(1, this.params.maxExpansionsPerFrame),
     };
-    this.lattice = new Lattice(anchorFen, anchorGrid, window, cfg, this.frames, this.tick);
-    this.dwellKey = null;
+    this.lattice = new Lattice(anchorFen, anchorGrid, window, cfg, this.frames, this.tick, this.age);
+    this.cache = null;
+    this.dwellKey = this.fastKey = this.favKey = null;
+    this.pendingNode = null;
   }
 
   /** Whether a window ply from index `finalCount + from` on was corrected less than the cooldown ago. */
@@ -456,6 +576,9 @@ export class GameTracker {
 
   /** Switches the committed window to `node`'s line at once, finalises, re-roots, and reports it. */
   private commit(node: HNode, t: number): GameEvent[] {
+    if (node.kind !== 'incumbent') {
+      this.timing = { kind: node.kind, stableAt: this.stableAt, unstableEndAt: this.unstableAt, favouriteAt: this.favKey === node.key ? this.favSince : t, committedAt: t };
+    }
     const oldWin = this.uci.slice(this.finalCount);
     const newWin = node.moves();
     const common = node.common;
