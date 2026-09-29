@@ -1085,6 +1085,8 @@ export class OccupancyTracker {
   orientReason: OrientRefusal | 'uncalibrated' | '' = '';
   /** Footprints and weights of the last frame, for the debug view. */
   debug: OccupancyDebug | null = null;
+  /** Per-stage times (ms) of the last update(): occFootprints, occSample, occCalib, occFeatures, occClassify. */
+  timings: Record<string, number> = {};
 
   /** Drops the models, the filter and the orientation (keeps the position hint). */
   reset(): void {
@@ -1136,6 +1138,14 @@ export class OccupancyTracker {
    * result is `stable` = `framed` = false with no grid. Occupancy is still computed (debug view, committedProb).
    */
   update(frame: RawFrame, hb: Mat3, params: Params, nowMs: number, visibleRect?: FrameRect): OccupancyResult {
+    const timings: Record<string, number> = {};
+    this.timings = timings;
+    let tLap = performance.now();
+    const lap = (name: string) => {
+      const now = performance.now();
+      timings[name] = now - tLap;
+      tLap = now;
+    };
     const raw = new Uint8Array(64);
     const conf = new Float32Array(64);
     const logLik = new Float32Array(64 * 3).fill(-Math.log(3));
@@ -1167,7 +1177,9 @@ export class OccupancyTracker {
       this.bootCount = 0;
     }
     const fp = cellFootprints(cam, frame.width, frame.height, params);
+    lap('occFootprints');
     const s = sampleFrame(frame, fp);
+    lap('occSample');
     const dev = param(params, OCCUPANCY_PARAMS, 'occDeviation');
 
     if (framed && this.state !== 'calibrated') this.tryBootstrap(fp, s, params, dev);
@@ -1175,6 +1187,7 @@ export class OccupancyTracker {
       const u = fitUnsupervised(cellFeatures(fp, s, new Float32Array(64).fill(0.3)), dev);
       if (u && this.calibrate(fp, s, u.grid, dev)) this.state = 'fallback';
     }
+    lap('occCalib');
     if (!this.models || !this.filter.committed) {
       this.orientReason = 'uncalibrated';
       return fail();
@@ -1196,6 +1209,7 @@ export class OccupancyTracker {
       if (r !== 'inconclusive') this.parityUnchecked = false;
       if (r === 'swapped') feats = featsNow();
     }
+    lap('occFeatures');
     const models = this.models;
     const outlier = param(params, OCCUPANCY_PARAMS, 'occOutlier');
     const scale = param(params, OCCUPANCY_PARAMS, 'occMarginScale');
@@ -1254,6 +1268,7 @@ export class OccupancyTracker {
     const committedProb = new Float32Array(64);
     for (let c = 0; c < 64; c++) committedProb[c] = Math.exp(logLik[c * 3 + committedNow[c]!]!);
     const grid = dropped || !framed ? null : new Uint8Array(committedNow);
+    lap('occClassify');
     return this.result(nowMs, grid, raw, conf, logLik, feats.vis, committedProb, stable, framed);
   }
 
