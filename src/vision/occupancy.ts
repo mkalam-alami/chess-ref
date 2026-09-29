@@ -561,6 +561,8 @@ const OUTLIER_EVIDENCE = 0.25;
 
 /** Occupancy prior of the occluder model from a grid (empty squares keep a small chance of a piece). */
 const priorOf = (grid: Uint8Array): number[] => Array.from(grid, (v) => (v === OCC_EMPTY ? 0.1 : 1));
+/** Occluder prior while the committed grid is stale (after an unresolved relabelling): no cell is trusted. */
+const STALE_PRIOR: readonly number[] = new Array<number>(64).fill(0.3);
 
 interface StartTest {
   score: number;
@@ -1086,12 +1088,17 @@ export class OccupancyTracker {
     const hintCells = this.hintCells();
     if (hintCells) this.filter.setCommitted(hintCells);
     const committed = this.filter.committed;
-    const prior = priorOf(committed);
-    let feats = cellFeatures(fp, s, prior, illumGains(cellFeatures(fp, s, prior), committed, this.refl));
+    // After an unresolved relabelling the committed grid belongs to another cell frame: used as the occluder prior and
+    // the illumination labels it would make the frame read as that stale grid (and never re-orient), so until the next
+    // orientation the features use a flat prior and no illumination correction, and nothing is learnt.
+    const stale = this.filterStale;
+    const prior = stale ? STALE_PRIOR : priorOf(committed);
+    const featsNow = () => cellFeatures(fp, s, prior, stale ? undefined : illumGains(cellFeatures(fp, s, prior), committed, this.refl));
+    let feats = featsNow();
     if (this.parityUnchecked) {
       const r = this.recheckParity(feats);
       if (r !== 'inconclusive') this.parityUnchecked = false;
-      if (r === 'swapped') feats = cellFeatures(fp, s, prior, illumGains(cellFeatures(fp, s, prior), committed, this.refl));
+      if (r === 'swapped') feats = featsNow();
     }
     const models = this.models;
     const outlier = param(params, OCCUPANCY_PARAMS, 'occOutlier');
@@ -1137,7 +1144,7 @@ export class OccupancyTracker {
     let frozen = this.filter.frozen(nowMs, params);
     if (!dropped) {
       frozen = this.filter.update(raw, conf, params, nowMs, !hintCells);
-      this.learn(feats, raw, conf, this.filter.committed!, params);
+      if (!stale) this.learn(feats, raw, conf, this.filter.committed!, params);
     }
     const stable = !dropped && !frozen;
     if (!this.orientOk && stable) this.tryOrient(logLik, hb, params);
@@ -1316,7 +1323,7 @@ export class OccupancyTracker {
     this.bootCount = 0;
   }
 
-  private weights(fp: Footprints, prior: number[]): Float32Array {
+  private weights(fp: Footprints, prior: readonly number[]): Float32Array {
     const w = new Float32Array(fp.w0.length);
     for (let k = 0; k < w.length; k++) {
       let keep = 1;
