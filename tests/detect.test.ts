@@ -36,6 +36,20 @@ describe('detector on real photos', () => {
   }, 60_000);
 });
 
+describe('low-threshold retry', () => {
+  it('recovers boards the first pass misses, can be disabled and still rejects the negative', () => {
+    // A Canny percentile of 99 starves the first pass of grid edges on most real photos; the retry at 92 restores them.
+    const cases = realCases(cv, 640);
+    const off = runCases(det, cases, { cannyPercentile: 99, retryCannyPercentile: 0 });
+    const on = runCases(det, cases, { cannyPercentile: 99, retryCannyPercentile: 92 });
+    const rescued = on.filter((o, i) => o.ok && !off[i]!.res.corners);
+    expect(rescued.length).toBeGreaterThanOrEqual(2);
+    for (const o of rescued) expect(o.res.timings.retry).toBe(1);
+    for (const o of off) expect(o.res.timings.retry).toBeUndefined();
+    expect(on.filter((o) => o.falsePositive)).toHaveLength(0);
+  }, 60_000);
+});
+
 describe('board profile lock', () => {
   it('infers L-only from every real photo, stays accurate when locked and still rejects the negative', () => {
     const cases = realCases(cv, 640);

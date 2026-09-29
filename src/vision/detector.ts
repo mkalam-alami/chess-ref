@@ -21,6 +21,16 @@ export const VANISHING_PARAMS: readonly ParamSpec[] = [
   { name: 'vpMinSeparation', min: 5, max: 60, step: 1, default: 20 },
 ];
 
+export const RETRY_PARAMS: readonly ParamSpec[] = [
+  /**
+   * When a full detection finds no board, retry once with this (lower) Canny percentile; 0 disables. The adaptive
+   * Canny threshold follows the whole image's gradient distribution, so a busy surround (wood grain, reflections)
+   * can push a board's weaker grid lines (low-contrast squares, one rank direction foreshortened) below it and the
+   * vanishing points lock onto clutter instead. Costs a second pass on frames without a board only.
+   */
+  { name: 'retryCannyPercentile', min: 0, max: 99, step: 1, default: 85 },
+];
+
 export const POLISH_PARAMS: readonly ParamSpec[] = [
   { name: 'polish', min: 0, max: 1, step: 1, default: 1 },
   { name: 'refit', min: 0, max: 1, step: 1, default: 1 },
@@ -52,6 +62,7 @@ export const ALL_PARAMS: readonly ParamSpec[] = [
   ...PREPROCESS_PARAMS,
   ...LINES_PARAMS,
   ...VANISHING_PARAMS,
+  ...RETRY_PARAMS,
   ...GRID_PARAMS,
   ...VERIFY_PARAMS,
   ...POLISH_PARAMS,
@@ -158,6 +169,17 @@ export class Detector {
 
   /** Accepts an RGBA Mat (not owned) or ImageData. */
   detect(input: Mat | ImageData, params: Params, opts: DetectOptions = {}): DetectResult {
+    const first = this.detectOnce(input, params, opts);
+    if (first.corners) return first;
+    const retry = param(params, RETRY_PARAMS, 'retryCannyPercentile');
+    if (retry <= 0 || retry >= param(params, PREPROCESS_PARAMS, 'cannyPercentile')) return first;
+    const second = this.detectOnce(input, { ...params, cannyPercentile: retry }, opts);
+    for (const [k, v] of Object.entries(first.timings)) second.timings[k] = (second.timings[k] ?? 0) + v;
+    second.timings.retry = 1;
+    return second;
+  }
+
+  private detectOnce(input: Mat | ImageData, params: Params, opts: DetectOptions): DetectResult {
     const cv = this.cv;
     const timings: Record<string, number> = {};
     const t0 = performance.now();
