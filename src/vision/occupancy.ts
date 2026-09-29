@@ -746,6 +746,11 @@ export interface OccupancyResult {
    * candidate (legal) positions: sum logLik[c * 3 + class(c)] over the cells.
    */
   logLik: Float32Array;
+  /**
+   * Per cell, this frame's probability (exp of logLik) of the cell's committed class, even when the frame is dropped
+   * (shows why). Null when not calibrated / no committed grid / no camera.
+   */
+  committedProb: Float32Array | null;
   stats: OccupancyStats;
 }
 
@@ -849,7 +854,7 @@ export class OccupancyTracker {
     const cam = cameraFromHomography(hb, frame.width, frame.height, param(params, OCCUPANCY_PARAMS, 'occFovDeg'));
     const fail = (): OccupancyResult => {
       this.lastStats = this.stats(0, true, false);
-      return { grid: null, raw, conf, logLik, stats: this.lastStats };
+      return { grid: null, raw, conf, logLik, committedProb: null, stats: this.lastStats };
     };
     if (!cam) return fail();
     const fp = cellFootprints(cam, frame.width, frame.height, params);
@@ -913,7 +918,10 @@ export class OccupancyTracker {
     }
     this.debug = { fp, weights: this.weights(fp, prior), raw, conf, feats };
     this.lastStats = this.stats(low, dropped, frozen);
-    return { grid: dropped ? null : new Uint8Array(this.filter.committed), raw, conf, logLik, stats: this.lastStats };
+    const committedNow = this.filter.committed ?? committed;
+    const committedProb = new Float32Array(64);
+    for (let c = 0; c < 64; c++) committedProb[c] = Math.exp(logLik[c * 3 + committedNow[c]!]!);
+    return { grid: dropped ? null : new Uint8Array(committedNow), raw, conf, logLik, committedProb, stats: this.lastStats };
   }
 
   private tryBootstrap(fp: Footprints, s: Samples, params: Params, dev: number): void {

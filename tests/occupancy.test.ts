@@ -209,6 +209,11 @@ describe('occupancy class log-likelihoods', () => {
               out = tr.update(fr, r.hb, {}, (t += 100));
               outLin = twin.update(fr, r.hb, lin, t);
             }
+            // committedProb: probability of the committed class, present even when this frame's grid is dropped.
+            expect(out.committedProb).not.toBeNull();
+            if (out.grid)
+              for (let c = 0; c < 64; c++)
+                expect(out.committedProb![c]).toBeCloseTo(Math.exp(out.logLik[c * 3 + out.grid[c]!]!), 5);
             for (let c = 0; c < 64; c++) {
               const l = out.logLik.subarray(c * 3, c * 3 + 3);
               expect(Math.abs(Math.exp(l[0]!) + Math.exp(l[1]!) + Math.exp(l[2]!) - 1)).toBeLessThan(1e-4);

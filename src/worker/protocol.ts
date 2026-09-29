@@ -66,6 +66,13 @@ export interface ResultMessage {
    * hands, no board); the main thread then keeps showing the last grid.
    */
   occupancy?: Uint8Array | null;
+  /**
+   * Per cell (same indexing as `occupancy`), this frame's calibrated probability of the cell's committed class
+   * (exp of the classifier log-likelihood). Sent whenever the tracker is calibrated and a board is present, even on
+   * frames where `occupancy` is dropped (so low-confidence cells are visible). Null otherwise; the main thread then
+   * keeps the last array with its grid.
+   */
+  occupancyProb?: Float32Array | null;
   occupancyStats?: OccupancyStats;
 }
 

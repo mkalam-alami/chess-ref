@@ -109,11 +109,13 @@ async function process(msg: FrameMessage): Promise<void> {
   // Occupancy samples the raw frame (not the CLAHE / L-only preprocessor output).
   t = performance.now();
   let grid: Uint8Array | null = null;
+  let occProb: Float32Array | null = null;
   let occStats: OccupancyStats | undefined;
   if (param(msg.params, OCCUPANCY_PARAMS, 'occupancy') > 0) {
     if (det.hb) {
       const occ = occupancy.update(img, det.hb, msg.params, performance.now());
       grid = occ.grid;
+      occProb = occ.committedProb;
       occStats = occ.stats;
     } else occStats = occupancy.noBoard(performance.now());
   }
@@ -175,6 +177,7 @@ async function process(msg: FrameMessage): Promise<void> {
     profile,
     debugImage,
     occupancy: grid,
+    occupancyProb: occProb,
     occupancyStats: occStats,
   };
   post(result, debugImage ? [debugImage] : []);

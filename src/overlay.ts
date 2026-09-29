@@ -64,6 +64,19 @@ export const DOT_EMPTY = '#000000';
 export const DOT_WHITE = '#ffffff';
 export const DOT_BLACK = '#00c853';
 export const DOT_OUTLINE = 'rgba(0,0,0,0.85)';
+/** Probability of the committed class below which a dot gets the low-confidence ring. */
+export const DOT_LOW_CONF = 0.6;
+/** Low-confidence ring: red dashes over a dark halo, legible on light and dark squares. */
+export const DOT_RING = '#ff1744';
+export const DOT_RING_HALO = 'rgba(0,0,0,0.75)';
+/** Fill opacity at probability 0; it rises linearly to 1 at probability 1. */
+export const DOT_MIN_ALPHA = 0.35;
+
+/** Fill opacity for a committed-class probability (missing / non-finite -> full confidence). */
+export function dotAlpha(p: number | undefined): number {
+  if (p === undefined || !Number.isFinite(p)) return 1;
+  return DOT_MIN_ALPHA + (1 - DOT_MIN_ALPHA) * Math.max(0, Math.min(1, p));
+}
 
 export interface OccDot {
   x: number;
@@ -72,18 +85,31 @@ export interface OccDot {
   fill: string;
   /** Whether the dot gets the thin dark outline (piece dots, so white shows on light squares). */
   outline: boolean;
+  /** Probability of the committed class (1 when unknown). */
+  conf: number;
+  /** Fill / outline opacity encoding `conf` (see dotAlpha). */
+  alpha: number;
+  /** Whether `conf` is below DOT_LOW_CONF: drawn with a dashed red ring. */
+  low: boolean;
 }
 
 /**
  * One dot per board cell for an occupancy grid (index j * 8 + i, see ResultMessage.occupancy), placed at the
  * projected centre of cell (i, j) under the homography mapping board (0,0), (8,0), (8,8), (0,8) to `corners`.
  * The radius scales with the projected cell size (sqrt of its area): small black dots for empty cells, larger
- * white / green dots for white / black pieces. Returns [] for a degenerate quad or a grid of the wrong size.
+ * white / green dots for white / black pieces. `prob` (ResultMessage.occupancyProb, same indexing) encodes
+ * confidence: opacity 0.35 + 0.65 p, and a low-confidence ring below DOT_LOW_CONF; without it every dot is
+ * drawn at full confidence. Returns [] for a degenerate quad or a grid of the wrong size.
  */
-export function occupancyDots(corners: readonly Point[], grid: ArrayLike<number>): OccDot[] {
+export function occupancyDots(
+  corners: readonly Point[],
+  grid: ArrayLike<number>,
+  prob: ArrayLike<number> | null = null,
+): OccDot[] {
   if (corners.length !== 4 || grid.length !== 64) return [];
   const h = homographyFrom4(BOARD_CORNERS, corners);
   if (!h) return [];
+  const probs = prob && prob.length === 64 ? prob : null;
   const dots: OccDot[] = [];
   for (let j = 0; j < 8; j++) {
     for (let i = 0; i < 8; i++) {
@@ -93,12 +119,18 @@ export function occupancyDots(corners: readonly Point[], grid: ArrayLike<number>
       if (!Number.isFinite(size)) continue;
       const [x, y] = applyH(h, [i + 0.5, j + 0.5]);
       const piece = v === OCC_WHITE || v === OCC_BLACK;
+      const p = probs ? probs[j * 8 + i]! : NaN;
+      const known = Number.isFinite(p);
+      const conf = known ? Math.max(0, Math.min(1, p)) : 1;
       dots.push({
         x,
         y,
         r: Math.max(piece ? 2.5 : 1.5, size * (piece ? 0.24 : 0.09)),
         fill: v === OCC_WHITE ? DOT_WHITE : v === OCC_BLACK ? DOT_BLACK : DOT_EMPTY,
         outline: piece,
+        conf,
+        alpha: known ? dotAlpha(conf) : 1,
+        low: known && conf < DOT_LOW_CONF,
       });
     }
   }
@@ -108,15 +140,31 @@ export function occupancyDots(corners: readonly Point[], grid: ArrayLike<number>
 export function drawDots(ctx: CanvasRenderingContext2D, dots: readonly OccDot[], alpha: number): void {
   if (alpha <= 0 || dots.length === 0) return;
   ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.lineWidth = 1.5;
-  ctx.strokeStyle = DOT_OUTLINE;
   for (const d of dots) {
+    ctx.globalAlpha = alpha * d.alpha;
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = DOT_OUTLINE;
+    ctx.setLineDash([]);
     ctx.beginPath();
     ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
     ctx.fillStyle = d.fill;
     ctx.fill();
     if (d.outline) ctx.stroke();
+    if (d.low) {
+      // Ring at full (quad) opacity so it stays visible even though the dot itself is faint.
+      ctx.globalAlpha = alpha;
+      const rr = d.r + Math.max(2.5, d.r * 0.35);
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, rr, 0, Math.PI * 2);
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = DOT_RING_HALO;
+      ctx.stroke();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = DOT_RING;
+      ctx.setLineDash([3, 2.5]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
   ctx.restore();
 }
@@ -128,6 +176,8 @@ interface HeldQuad {
   time: number;
   /** Occupancy grid shown with the quad (corners[k] <-> board corner k), or null. */
   grid: Uint8Array | null;
+  /** Committed-class probability per cell (ResultMessage.occupancyProb), or null for full-confidence styling. */
+  prob: Float32Array | null;
 }
 
 /** Fullscreen canvas above the video: draws the held quad and an optional debug image. */
@@ -159,8 +209,15 @@ export class Overlay {
    * Points are in the coordinates of a frame of size frameW x frameH; points[k] must be board corner k
    * ((0,0), (8,0), (8,8), (0,8)) for the optional occupancy grid to line up.
    */
-  setQuad(points: Point[], frameW: number, frameH: number, timeMs: number, grid: Uint8Array | null = null): void {
-    this.quad = { points, frameW, frameH, time: timeMs, grid };
+  setQuad(
+    points: Point[],
+    frameW: number,
+    frameH: number,
+    timeMs: number,
+    grid: Uint8Array | null = null,
+    prob: Float32Array | null = null,
+  ): void {
+    this.quad = { points, frameW, frameH, time: timeMs, grid, prob };
   }
 
   /** Time since the last quad was set, or Infinity. */
@@ -192,6 +249,6 @@ export class Overlay {
     const m = coverMap(q.frameW, q.frameH, this.viewW, this.viewH);
     const screen = q.points.map((p) => frameToScreen(p, m));
     drawQuad(ctx, screen, alpha);
-    if (q.grid) drawDots(ctx, occupancyDots(screen, q.grid), alpha);
+    if (q.grid) drawDots(ctx, occupancyDots(screen, q.grid, q.prob), alpha);
   }
 }

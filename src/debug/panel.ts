@@ -1,3 +1,4 @@
+import { DOT_LOW_CONF } from '../overlay';
 import { DEBUG_VIEWS, type DebugView, type OccupancyStats, type Params } from '../worker/protocol';
 
 export const RESOLUTIONS = [480, 640, 800] as const;
@@ -62,12 +63,27 @@ export interface DebugStats {
  * Occupancy summary for the stats block: bootstrap state, committed W/B/empty counts, low-confidence cells on the
  * last frame, the fraction of frames whose occupancy was dropped over the recent window, and the freeze flag.
  */
-export function formatOccupancy(s: OccupancyStats | undefined, dropRate: number | null): string {
+export function formatOccupancy(
+  s: OccupancyStats | undefined,
+  dropRate: number | null,
+  prob: ArrayLike<number> | null = null,
+): string {
   if (!s) return 'occ     -\n';
   const drop = dropRate === null ? '-' : `${Math.round(100 * dropRate)}%`;
+  let conf = '';
+  if (prob && prob.length > 0) {
+    let min = 1;
+    let n = 0;
+    for (let c = 0; c < prob.length; c++) {
+      min = Math.min(min, prob[c]!);
+      if (prob[c]! < DOT_LOW_CONF) n++;
+    }
+    conf = `occ conf min ${min.toFixed(2)}, <${DOT_LOW_CONF}: ${n} cells\n`;
+  }
   return (
     `occ     ${s.state} W${s.white} B${s.black} E${s.empty}\n` +
-    `        low ${s.lowCells}  drop ${drop}/2s${s.dropped ? ' (now)' : ''}${s.frozen ? '  FROZEN' : ''}\n`
+    `        low ${s.lowCells}  drop ${drop}/2s${s.dropped ? ' (now)' : ''}${s.frozen ? '  FROZEN' : ''}\n` +
+    conf
   );
 }
 

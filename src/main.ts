@@ -52,7 +52,7 @@ const modeCounts = { full: 0, tracking: 0 };
 
 // The worker keeps corners[k] = board corner k across frames (orientation is stabilised in TrackingSession), so
 // the quad is only smoothed here, never reordered: reordering would misalign the occupancy grid.
-const tracker = { filter: new PointsFilter(4, 1.0, 0.02), grid: null as Uint8Array | null };
+const tracker = { filter: new PointsFilter(4, 1.0, 0.02), grid: null as Uint8Array | null, prob: null as Float32Array | null };
 let occStats: OccupancyStats | undefined;
 /** (time, dropped) per result carrying occupancy stats, over the last ~2 s. */
 const occDrops: Array<[number, boolean]> = [];
@@ -116,19 +116,22 @@ function handleResult(r: ResultMessage): void {
     if (overlay.msSinceQuad(now) > HOLD_MS + FADE_MS) {
       tracker.filter.reset();
       tracker.grid = null;
+      tracker.prob = null;
     }
     // Never draw a bow-tie: drop the result (the previous quad and grid are held / fade).
     if (isSimpleQuad(r.corners)) {
       // A null occupancy (dropped frame) keeps showing the last committed grid.
       if (r.occupancy) tracker.grid = r.occupancy;
-      overlay.setQuad(tracker.filter.filter(r.corners, now / 1000), r.width, r.height, now, tracker.grid);
+      // Confidence of the committed classes, also sent on dropped frames; a null keeps the previous one.
+      if (r.occupancyProb) tracker.prob = r.occupancyProb;
+      overlay.setQuad(tracker.filter.filter(r.corners, now / 1000), r.width, r.height, now, tracker.grid, tracker.grid ? tracker.prob : null);
     }
   }
 }
 
 function occupancyText(): string {
   const rate = occDrops.length ? occDrops.filter(([, d]) => d).length / occDrops.length : null;
-  return formatOccupancy(occStats, rate);
+  return formatOccupancy(occStats, rate, tracker.grid ? tracker.prob : null);
 }
 
 function showError(text: string): void {
