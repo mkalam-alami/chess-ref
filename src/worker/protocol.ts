@@ -59,6 +59,32 @@ export interface ResultMessage {
   profile?: BoardProfile | null;
   /** Frame-sized RGBA image for the selected debug view (transferred). */
   debugImage?: ImageBitmap;
+  /**
+   * Committed square occupancy (64 entries, row-major in board cell coordinates: cell (i, j) at index j * 8 + i,
+   * where corners[0] is board point (0,0), corners[1] (8,0), corners[2] (8,8), corners[3] (0,8)).
+   * Values: OCC_EMPTY 0, OCC_WHITE 1, OCC_BLACK 2. Null when this frame's occupancy was dropped (low confidence,
+   * hands, no board); the main thread then keeps showing the last grid.
+   */
+  occupancy?: Uint8Array | null;
+  occupancyStats?: OccupancyStats;
+}
+
+export const OCC_EMPTY = 0;
+export const OCC_WHITE = 1;
+export const OCC_BLACK = 2;
+
+export interface OccupancyStats {
+  /** 'start' = waiting for the starting position to calibrate; 'calibrated' = models learned from it; 'fallback' = unsupervised. */
+  state: 'start' | 'calibrated' | 'fallback';
+  empty: number;
+  white: number;
+  black: number;
+  /** Cells whose confidence was below the per-cell minimum on this frame (not updated). */
+  lowCells: number;
+  /** Whether this frame's occupancy evidence was dropped as a whole. */
+  dropped: boolean;
+  /** Whether updates are frozen (mass change, e.g. a hand over the board). */
+  frozen: boolean;
 }
 
 export type WorkerToMain = ReadyMessage | ErrorMessage | ResultMessage;
