@@ -5,6 +5,7 @@ import type { Quad } from './geom/homography';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS } from './overlay';
 import { ALL_PARAMS } from './vision/detector';
+import { describeProfile } from './vision/profile';
 import type { FrameMessage, ResultMessage, WorkerToMain } from './worker/protocol';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -41,6 +42,13 @@ let lastFrameH = 0;
 let lastTimings: Record<string, number> = {};
 let confidence = 0;
 let mode = 'full';
+let profileText = describeProfile(null);
+const resetBoardBtn = $<HTMLButtonElement>('resetBoard');
+resetBoardBtn.addEventListener('click', () => {
+  worker.postMessage({ type: 'resetProfile' });
+  resetBoardBtn.hidden = true;
+  profileText = describeProfile(null);
+});
 
 const tracker = { prev: null as Quad | null, filter: new PointsFilter(4, 1.0, 0.02) };
 const detTimes: number[] = [];
@@ -78,6 +86,8 @@ function handleResult(r: ResultMessage): void {
   lastTimings = r.timings;
   confidence = r.confidence;
   mode = r.mode;
+  resetBoardBtn.hidden = !r.profile;
+  profileText = describeProfile(r.profile ?? null);
   lastFrameW = r.width;
   lastFrameH = r.height;
   // A debug image is only ever shown while the panel is open and a real view is selected; otherwise it would
@@ -180,7 +190,7 @@ function loop(now: number): void {
   if (running && source) {
     void pump();
     overlay.draw(now, lastFrameW || source.width, lastFrameH || source.height);
-    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, mode });
+    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, mode, profile: profileText });
   }
   requestAnimationFrame(loop);
 }

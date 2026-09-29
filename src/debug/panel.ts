@@ -53,6 +53,7 @@ export interface DebugStats {
   timings: Record<string, number>;
   confidence: number;
   mode: string;
+  profile?: string;
 }
 
 const STYLE = `
@@ -148,7 +149,7 @@ export class DebugPanel {
       .join('\n');
     this.stats.textContent =
       `render  ${s.fps.toFixed(0)} fps\ndetect  ${s.detectionsPerSec.toFixed(1)} /s\n` +
-      `mode    ${s.mode}\nconf    ${s.confidence.toFixed(2)}\n${timings}`;
+      `mode    ${s.mode}\nprofile ${s.profile ?? '-'}\nconf    ${s.confidence.toFixed(2)}\n${timings}`;
   }
 
   private select(

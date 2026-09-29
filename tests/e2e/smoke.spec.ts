@@ -17,6 +17,9 @@ test('camera starts, worker loads OpenCV, no console errors', async ({ page }) =
   await page.waitForTimeout(1500);
   await expect(page.locator('#overlay')).toHaveAttribute('data-debug-image', 'off');
 
+  // No board profile is locked without a board in view, so the reset button stays hidden.
+  await expect(page.locator('#resetBoard')).toBeHidden();
+
   // Frames flow through the worker: open the panel and wait for stage timings.
   await page.click('.dbg-toggle');
   await expect(page.locator('.dbg-panel pre')).toContainText('canny', { timeout: 30_000 });
