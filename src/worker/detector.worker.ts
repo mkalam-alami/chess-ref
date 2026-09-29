@@ -4,6 +4,7 @@ import type { CV } from '../vision/preprocess';
 import { Detector } from '../vision/detector';
 import { drawLines, drawVerify, rectifiedView } from '../vision/debugViews';
 import { ProfileLock } from '../vision/profile';
+import { TrackingSession } from './tracker';
 import type { DebugView, FrameMessage, MainToWorker, ResultMessage, WorkerToMain } from './protocol';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
@@ -50,6 +51,7 @@ async function loadOpenCV(): Promise<{ cv: CV }> {
 interface State {
   cv: CV;
   detector: Detector;
+  session: TrackingSession;
   rgba: InstanceType<CV['Mat']> | null;
   rgbaOut: InstanceType<CV['Mat']>;
 }
@@ -93,7 +95,9 @@ async function process(msg: FrameMessage): Promise<void> {
 
   const view: DebugView = msg.debugView;
   const wantDebug = view === 'lines' || view === 'rectified' || view === 'verify';
-  const det = s.detector.detect(s.rgba, msg.params, { debug: wantDebug, profile: profileLock.profile }); // TODO(A): pass profile into track() too
+  // Debug views need the full pipeline's intermediate images, so they disable tracking.
+  const params = view === 'none' ? msg.params : { ...msg.params, tracking: 0 };
+  const det = s.session.process(s.rgba, width, height, params, { debug: wantDebug, profile: profileLock.profile });
   const profile = profileLock.update(det, performance.now(), msg.params);
   Object.assign(timings, det.timings);
   const pre = s.detector.lastPre!;
@@ -143,7 +147,7 @@ async function process(msg: FrameMessage): Promise<void> {
     height,
     corners: det.corners,
     confidence: det.confidence,
-    mode: 'full',
+    mode: det.mode,
     timings,
     profile,
     debugImage,
@@ -155,6 +159,10 @@ let queue: Promise<void> = Promise.resolve();
 
 scope.onmessage = (ev: MessageEvent<MainToWorker>) => {
   const msg = ev.data;
+  if (msg.type === 'reset') {
+    state?.session.reset();
+    return;
+  }
   if (msg.type === 'resetProfile') {
     profileLock.reset();
     return;
@@ -170,9 +178,11 @@ scope.onmessage = (ev: MessageEvent<MainToWorker>) => {
 
 loadOpenCV().then(
   ({ cv }) => {
+    const detector = new Detector(cv);
     state = {
       cv,
-      detector: new Detector(cv),
+      detector,
+      session: new TrackingSession(detector),
       rgba: null,
       rgbaOut: new cv.Mat(),
     };

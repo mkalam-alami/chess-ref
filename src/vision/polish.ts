@@ -46,7 +46,7 @@ export class EdgePolisher {
     this.dt.delete();
   }
 
-  polish(edges: Mat, hb: Mat3, opts: { maxShiftFrac: number; points?: readonly CornerPoint[]; pointWeight?: number } = { maxShiftFrac: 0.05 }): PolishResult {
+  polish(edges: Mat, hb: Mat3, opts: { maxShiftFrac: number; points?: readonly CornerPoint[]; pointWeight?: number; startStepFrac?: number } = { maxShiftFrac: 0.05 }): PolishResult {
     const cv = this.cv;
     cv.bitwise_not(edges, this.inv);
     cv.distanceTransform(this.inv, this.dt, cv.DIST_L2, 3);
@@ -111,7 +111,7 @@ export class EdgePolisher {
     let curCost = cost(cur);
     const before = curCost;
     const dirs: Array<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
-    for (let step = Math.max(1, 0.02 * diag); step >= 0.3; step *= 0.5) {
+    for (let step = Math.max(1, (opts.startStepFrac ?? 0.02) * diag); step >= 0.3; step *= 0.5) {
       for (let iter = 0; iter < 6; iter++) {
         let improved = false;
         for (let k = 0; k < 4; k++) {

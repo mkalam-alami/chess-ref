@@ -6,6 +6,7 @@ import { combOptions, fitComb, GRID_PARAMS, segmentPositions, toothSegments, typ
 import { extractLines, LINES_PARAMS } from './lines';
 import { param, Preprocessor, PREPROCESS_PARAMS, type CV, type ParamSpec, type PreprocessResult } from './preprocess';
 import { EdgePolisher } from './polish';
+import { TrackPreprocessor } from './trackPre';
 import { CornerRefiner, refineOptions, REFINE_PARAMS, type RefineResult } from './refine';
 import type { BoardProfile } from './profile';
 import { PROFILE_PARAMS } from './profile';
@@ -24,6 +25,25 @@ export const POLISH_PARAMS: readonly ParamSpec[] = [
   { name: 'refit', min: 0, max: 1, step: 1, default: 1 },
 ];
 
+export const TRACK_PARAMS: readonly ParamSpec[] = [
+  /** Minimum checker score for a tracked frame to be accepted. */
+  { name: 'trackAccept', min: 0.1, max: 0.9, step: 0.05, default: 0.35 },
+  /** Maximum mean edge distance (px, capped) of the grid lines after the polish. */
+  { name: 'trackMaxEdgeDist', min: 0.5, max: 6, step: 0.1, default: 2 },
+  /** 1 = crop to the previous quad and verify at half resolution (faster, but currently rejects most frames; off). */
+  { name: 'trackRoi', min: 0, max: 1, step: 1, default: 0 },
+  /** Crop margin around the previous quad, as a fraction of its diagonal. */
+  { name: 'trackMargin', min: 0.01, max: 0.3, step: 0.01, default: 0.08 },
+  /** Initial pattern-search step of the tracking polish, as a fraction of the quad diagonal. */
+  { name: 'trackStep', min: 0.002, max: 0.03, step: 0.001, default: 0.02 },
+  /** Worker: force a full detection every N frames (0 = never). */
+  { name: 'trackFullEvery', min: 0, max: 200, step: 5, default: 30 },
+  /** Worker: force a full detection when the last one is older than this many ms. */
+  { name: 'trackMaxMs', min: 200, max: 5000, step: 100, default: 1000 },
+  /** Worker: 0 disables tracking entirely. */
+  { name: 'tracking', min: 0, max: 1, step: 1, default: 1 },
+];
+
 /** All tunables of the detection pipeline; the main thread registers them as debug sliders. */
 export const ALL_PARAMS: readonly ParamSpec[] = [
   ...PREPROCESS_PARAMS,
@@ -34,6 +54,7 @@ export const ALL_PARAMS: readonly ParamSpec[] = [
   ...POLISH_PARAMS,
   ...REFINE_PARAMS,
   ...PROFILE_PARAMS,
+  ...TRACK_PARAMS,
 ];
 
 export interface CandidateInfo {
@@ -74,6 +95,8 @@ export interface DetectResult {
   verify?: { channel: number; contrast: number; ringFactor: number; ringLevel?: number };
   /** Verified board (cell units) -> image homography (present when corners are). */
   hb?: Mat3;
+  /** Set by Detector.track(). */
+  track?: { prevScore: number; edgeDist: number; reason?: string };
 }
 
 export interface DetectOptions {
@@ -111,6 +134,7 @@ export class Detector {
   private readonly pre: Preprocessor;
   private readonly polisher: EdgePolisher;
   private readonly refiner = new CornerRefiner();
+  private trackPre: TrackPreprocessor | null = null;
   private rgba: Mat | null = null;
   /** Preprocessing outputs of the last detect() (valid until the next call). */
   lastPre: PreprocessResult | null = null;
@@ -123,6 +147,7 @@ export class Detector {
   dispose(): void {
     this.pre.dispose();
     this.polisher.dispose();
+    this.trackPre?.dispose();
     this.rgba?.delete();
     this.rgba = null;
   }
@@ -269,6 +294,80 @@ export class Detector {
     res.verify = { channel: fv.channel, contrast: fv.contrast, ringFactor: fv.ringFactor, ringLevel: fv.ringLevel };
     res.hb = hb;
     return res;
+  }
+
+  /**
+   * Tracking: re-fit the board starting from the previous verified homography. Cut-down preprocessing (no lines,
+   * vanishing points or grid), an edge-distance polish from `prevHb`, then the checker verification. Returns
+   * `corners: null` (caller should fall back to a full detect()) when the fit does not verify.
+   */
+  track(input: Mat | ImageData, params: Params, prevHb: Mat3, opts: DetectOptions = {}): DetectResult {
+    const cv = this.cv;
+    const timings: Record<string, number> = {};
+    const t0 = performance.now();
+    let t = t0;
+    let rgba: Mat;
+    if ('cols' in input) {
+      rgba = input;
+    } else {
+      if (!this.rgba || this.rgba.cols !== input.width || this.rgba.rows !== input.height) {
+        this.rgba?.delete();
+        this.rgba = new cv.Mat(input.height, input.width, cv.CV_8UC4);
+      }
+      this.rgba.data.set(input.data);
+      rgba = this.rgba;
+    }
+    const width = rgba.cols;
+    const height = rgba.rows;
+    this.trackPre ??= new TrackPreprocessor(cv);
+    if (!isValidQuad(boardCorners(prevHb), width, height)) {
+      timings.total = performance.now() - t0;
+      return { corners: null, confidence: 0, timings, track: { prevScore: 0, edgeDist: 0, reason: 'bad prev' } };
+    }
+    // Crop to the previous quad plus a margin; everything below works in crop coordinates.
+    const pq = boardCorners(prevHb);
+    const diag = Math.hypot(pq[2][0] - pq[0][0], pq[2][1] - pq[0][1]);
+    const margin = Math.max(16, param(params, TRACK_PARAMS, 'trackMargin') * diag);
+    const x0 = Math.max(0, Math.floor(Math.min(...pq.map((p) => p[0])) - margin)) & ~1;
+    const y0 = Math.max(0, Math.floor(Math.min(...pq.map((p) => p[1])) - margin)) & ~1;
+    const x1 = Math.min(width, Math.ceil(Math.max(...pq.map((p) => p[0])) + margin));
+    const y1 = Math.min(height, Math.ceil(Math.max(...pq.map((p) => p[1])) + margin));
+    const useRoi = param(params, TRACK_PARAMS, 'trackRoi') > 0;
+    const roi = useRoi ? { x: x0, y: y0, w: (x1 - x0) & ~1, h: (y1 - y0) & ~1 } : { x: 0, y: 0, w: width, h: height };
+    const pre = useRoi ? this.trackPre.run(rgba, params, roi) : this.trackPre.runFull(rgba, params);
+    Object.assign(timings, pre.timings);
+    t = performance.now();
+    const lab: Lab3 = { data: pre.labEq.data, width: useRoi ? roi.w >> 1 : width, height: useRoi ? roi.h >> 1 : height };
+    const fail = (reason: string, prevScore = 0, edgeDist = 0): DetectResult => {
+      timings.total = performance.now() - t0;
+      return { corners: null, confidence: 0, timings, track: { prevScore, edgeDist, reason } };
+    };
+    const vopt = verifyOptions(params, opts.profile);
+    // Board -> crop pixels.
+    const toCrop: Mat3 = [1, 0, -roi.x, 0, 1, -roi.y, 0, 0, 1];
+    const hbCrop = mul3(toCrop, prevHb);
+    const pol = this.polisher.polish(pre.edges, hbCrop, { maxShiftFrac: 0.04, startStepFrac: param(params, TRACK_PARAMS, 'trackStep') });
+    timings.polish = performance.now() - t;
+    t = performance.now();
+    const hb = mul3([1, 0, roi.x, 0, 1, roi.y, 0, 0, 1], pol.hb);
+    const q = boardCorners(hb);
+    if (!isValidQuad(q, width, height)) return fail('bad quad', 0, pol.after);
+    // The verification image is half resolution.
+    const hbHalf = useRoi ? mul3([0.5, 0, 0, 0, 0.5, 0, 0, 0, 1], pol.hb) : pol.hb;
+    const v = verifyBoard(lab, hbHalf, vopt);
+    timings.verify = performance.now() - t;
+    const maxEdge = param(params, TRACK_PARAMS, 'trackMaxEdgeDist');
+    if (pol.after > maxEdge) return fail('edge distance', v.score, pol.after);
+    if (v.score < param(params, TRACK_PARAMS, 'trackAccept')) return fail('below threshold', v.score, pol.after);
+    timings.total = performance.now() - t0;
+    return {
+      corners: orientedCorners(q),
+      confidence: v.score,
+      timings,
+      hb,
+      verify: { channel: v.channel, contrast: v.contrast, ringFactor: v.ringFactor },
+      track: { prevScore: 0, edgeDist: pol.after },
+    };
   }
 }
 

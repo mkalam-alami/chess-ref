@@ -1,6 +1,6 @@
 import { CameraError, FrameGrabber, loadFileSource, startCamera, type FrameSource } from './camera';
 import { DebugPanel, getParams, registerParam } from './debug/panel';
-import { stabiliseCorners } from './geom/cornerOrder';
+import { repairQuad, stabiliseCorners } from './geom/cornerOrder';
 import type { Quad } from './geom/homography';
 import { PointsFilter } from './geom/oneEuro';
 import { Overlay, FADE_MS, HOLD_MS } from './overlay';
@@ -49,6 +49,7 @@ resetBoardBtn.addEventListener('click', () => {
   resetBoardBtn.hidden = true;
   profileText = describeProfile(null);
 });
+const modeCounts = { full: 0, tracking: 0 };
 
 const tracker = { prev: null as Quad | null, filter: new PointsFilter(4, 1.0, 0.02) };
 const detTimes: number[] = [];
@@ -88,6 +89,7 @@ function handleResult(r: ResultMessage): void {
   mode = r.mode;
   resetBoardBtn.hidden = !r.profile;
   profileText = describeProfile(r.profile ?? null);
+  modeCounts[r.mode]++;
   lastFrameW = r.width;
   lastFrameH = r.height;
   // A debug image is only ever shown while the panel is open and a real view is selected; otherwise it would
@@ -103,9 +105,13 @@ function handleResult(r: ResultMessage): void {
       tracker.prev = null;
       tracker.filter.reset();
     }
-    const ordered = tracker.prev ? stabiliseCorners(tracker.prev, r.corners) : r.corners;
-    tracker.prev = ordered;
-    overlay.setQuad(tracker.filter.filter(ordered, now / 1000), r.width, r.height, now);
+    // Never draw a bow-tie: reorder it, or drop the result (the previous quad is held / fades).
+    const simple = repairQuad(r.corners);
+    if (simple) {
+      const ordered = tracker.prev ? stabiliseCorners(tracker.prev, simple) : simple;
+      tracker.prev = ordered;
+      overlay.setQuad(tracker.filter.filter(ordered, now / 1000), r.width, r.height, now);
+    }
   }
 }
 
@@ -151,6 +157,8 @@ async function begin(open: () => Promise<FrameSource>, fullscreen: boolean): Pro
   startScreen.hidden = true;
   running = true;
   overlay.setDebugImage(null);
+  worker.postMessage({ type: 'reset' });
+  modeCounts.full = modeCounts.tracking = 0;
   updateLoading();
   setStatus('running');
 }
@@ -190,7 +198,7 @@ function loop(now: number): void {
   if (running && source) {
     void pump();
     overlay.draw(now, lastFrameW || source.width, lastFrameH || source.height);
-    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, mode, profile: profileText });
+    panel.update({ fps, detectionsPerSec: detTimes.length, timings: lastTimings, confidence, profile: profileText, mode: `${mode} (tracked ${Math.round((100 * modeCounts.tracking) / Math.max(1, modeCounts.full + modeCounts.tracking))}%)` });
   }
   requestAnimationFrame(loop);
 }

@@ -26,7 +26,12 @@ export interface ResetProfileMessage {
   type: 'resetProfile';
 }
 
-export type MainToWorker = FrameMessage | ResetProfileMessage;
+/** Source changed: drop the tracked board. */
+export interface ResetMessage {
+  type: 'reset';
+}
+
+export type MainToWorker = FrameMessage | ResetProfileMessage | ResetMessage;
 
 export interface ReadyMessage {
   type: 'ready';

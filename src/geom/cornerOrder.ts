@@ -25,3 +25,20 @@ export function stabiliseCorners(prev: Quad, next: Quad): Quad {
   }
   return best;
 }
+
+/** True when no two opposite edges of the quad cross (i.e. it is not a bow-tie). */
+export function isSimpleQuad(q: Quad): boolean {
+  const cross = (o: Point, a: Point, b: Point) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const hit = (p1: Point, p2: Point, p3: Point, p4: Point) =>
+    cross(p1, p2, p3) * cross(p1, p2, p4) < 0 && cross(p3, p4, p1) * cross(p3, p4, p2) < 0;
+  return !hit(q[0], q[1], q[2], q[3]) && !hit(q[1], q[2], q[3], q[0]);
+}
+
+/** Reorders a self-intersecting quad into a simple one (convex-hull order around the centroid); null if degenerate. */
+export function repairQuad(q: Quad): Quad | null {
+  if (isSimpleQuad(q)) return q;
+  const cx = q.reduce((s, p) => s + p[0], 0) / 4;
+  const cy = q.reduce((s, p) => s + p[1], 0) / 4;
+  const r = [...q].sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx)) as Quad;
+  return isSimpleQuad(r) ? r : null;
+}
