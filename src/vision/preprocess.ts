@@ -32,13 +32,22 @@ export function param(params: Params, spec: readonly ParamSpec[], name: string):
 export interface PreprocessResult {
   /** CLAHE-equalised L channel (8U). */
   l: Mat;
-  /** CLAHE-L, a*, b* interleaved (8UC3), for the checker verification. */
+  /** CLAHE-L, a*, b* interleaved (8UC3), for the checker verification. With an L-only profile this is the
+   *  single-channel CLAHE-L image (stride 1). */
   labEq: Mat;
+  /** Interleaved channel count of `labEq` (3, or 1 for the L-only fast path). */
+  stride: 1 | 3;
   /** Max over L, a*, b* Sobel magnitudes, scaled to 8U for display. */
   gradient: Mat;
   /** Union of Canny edges over L, a*, b* (8U, 0/255). */
   edges: Mat;
   timings: Record<string, number>;
+}
+
+export interface PreprocessOptions {
+  /** Subset of [0 L, 1 a*, 2 b*] for which gradient and edges are computed. Default: all three. When it is
+   *  exactly [0], the Lab conversion is skipped (grayscale + CLAHE, single-channel output). */
+  channels?: readonly number[];
 }
 
 /** Percentiles (0-100) of an 8-bit image via one histogram. */
@@ -105,7 +114,7 @@ export class Preprocessor {
     this.ksize = new cv.Size(5, 5);
   }
 
-  run(rgba: Mat, params: Params): PreprocessResult {
+  run(rgba: Mat, params: Params, opts: PreprocessOptions = {}): PreprocessResult {
     const cv = this.cv;
     const timings: Record<string, number> = {};
     let t = performance.now();
@@ -115,19 +124,27 @@ export class Preprocessor {
       t = now;
     };
 
-    cv.cvtColor(rgba, this.rgb, cv.COLOR_RGBA2RGB);
-    cv.cvtColor(this.rgb, this.lab, cv.COLOR_RGB2Lab);
-    cv.split(this.lab, this.channels);
-    lap('lab');
-
+    const chanList = opts.channels && opts.channels.length > 0 ? [...opts.channels].sort() : [0, 1, 2];
+    const lOnly = chanList.length === 1 && chanList[0] === 0;
     this.clahe.setClipLimit(param(params, PREPROCESS_PARAMS, 'claheClip'));
-    const l = this.channels.get(0);
-    try {
-      this.clahe.apply(l, this.lEq);
-    } finally {
-      l.delete();
+    if (lOnly) {
+      // Fast path: luminance only, no Lab conversion and no a*, b*.
+      cv.cvtColor(rgba, this.chan, cv.COLOR_RGBA2GRAY);
+      lap('lab');
+      this.clahe.apply(this.chan, this.lEq);
+    } else {
+      cv.cvtColor(rgba, this.rgb, cv.COLOR_RGBA2RGB);
+      cv.cvtColor(this.rgb, this.lab, cv.COLOR_RGB2Lab);
+      cv.split(this.lab, this.channels);
+      lap('lab');
+      const l = this.channels.get(0);
+      try {
+        this.clahe.apply(l, this.lEq);
+      } finally {
+        l.delete();
+      }
     }
-    {
+    if (!lOnly) {
       // Interleave equalised L with the untouched a*, b* for the verification stage.
       const a = this.channels.get(1);
       const b = this.channels.get(2);
@@ -155,7 +172,7 @@ export class Preprocessor {
     let first = true;
     let gradientMs = 0;
     let cannyMs = 0;
-    for (let c = 0; c < 3; c++) {
+    for (const c of chanList) {
       let t0 = performance.now();
       if (c === 0) {
         this.lEq.copyTo(this.chan);
@@ -199,7 +216,7 @@ export class Preprocessor {
     cv.resize(this.magMax, this.gradient, new cv.Size(rgba.cols, rgba.rows), 0, 0, cv.INTER_LINEAR);
     lap('gradientScale');
 
-    return { l: this.lEq, labEq: this.labEq, gradient: this.gradient, edges: this.edges, timings };
+    return { l: this.lEq, labEq: lOnly ? this.lEq : this.labEq, stride: lOnly ? 1 : 3, gradient: this.gradient, edges: this.edges, timings };
   }
 
   dispose(): void {

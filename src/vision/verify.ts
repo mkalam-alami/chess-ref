@@ -1,10 +1,13 @@
 import type { Params } from '../worker/protocol';
 import { applyH, type Mat3, type Point } from '../geom/homography';
 import { param, type ParamSpec } from './preprocess';
+import type { BoardProfile } from './profile';
 
 export const VERIFY_PARAMS: readonly ParamSpec[] = [
   { name: 'verifyAccept', min: 0.1, max: 0.9, step: 0.05, default: 0.4 },
   { name: 'verifyContrast', min: 0.5, max: 12, step: 0.5, default: 3 },
+  /** With a locked profile: the contrast needed for a full score is this fraction of the profile's contrast. */
+  { name: 'profileContrastFrac', min: 0, max: 1, step: 0.05, default: 0.3 },
 ];
 
 /** Interleaved 3-channel 8-bit image (CLAHE-L, a*, b*). */
@@ -12,14 +15,30 @@ export interface Lab3 {
   data: ArrayLike<number>;
   width: number;
   height: number;
+  /** Interleaved channels per pixel; default 3. Stride 1 holds CLAHE-L only (channel 0). */
+  stride?: number;
 }
 
 export interface VerifyOptions {
   minContrast: number;
+  /** Channels to score (default all of 0, 1, 2 that the image holds). */
+  channels?: readonly number[];
+  /** Observed surround of a locked profile; a candidate whose ring level contradicts it is penalised. */
+  surround?: BoardProfile['surround'];
+  /** Reporting only: another channel must beat channel 0 by this margin to be reported as the winner. */
+  lBias?: number;
 }
 
-export function verifyOptions(params: Params): VerifyOptions {
-  return { minContrast: param(params, VERIFY_PARAMS, 'verifyContrast') };
+/** Verify options; with a locked profile only its verify channel is scored and the contrast floor follows it. */
+export function verifyOptions(params: Params, profile?: BoardProfile | null): VerifyOptions {
+  const minContrast = param(params, VERIFY_PARAMS, 'verifyContrast');
+  if (!profile) return { minContrast };
+  const frac = param(params, VERIFY_PARAMS, 'profileContrastFrac');
+  return {
+    minContrast: Math.max(minContrast, frac * Math.abs(profile.contrast)),
+    channels: [profile.verifyChannel],
+    surround: profile.surround,
+  };
 }
 
 export interface VerifyResult {
@@ -34,6 +53,9 @@ export interface VerifyResult {
   cells: Float32Array;
   /** Signed pair differences median (for the winning channel), for debugging. */
   contrast: number;
+  /** Median of the ring cells around the core on the winning channel, as a position between the dark (0) and
+   *  light (1) square levels. NaN when not measurable. Used to classify the surround. */
+  ringLevel: number;
 }
 
 // Sample offsets inside a cell: a grid over the outer part, skipping the centre where pieces stand.
@@ -55,13 +77,19 @@ const median = (a: Float32Array, n: number): number => {
   return n & 1 ? s[n >> 1]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
 };
 
+/** A 'dark' surround should sit clearly below the light squares, a 'bare' one clearly above the dark squares. */
+const SURROUND_DARK_MAX = 0.7;
+const SURROUND_BARE_MIN = 0.3;
+
 const GRID = 10; // 8 cells + 1 margin cell on each side
 
 /** Median value per cell (row-major 10x10 incl. margin) and channel; NaN where not visible. */
-export function sampleCells(img: Lab3, hb: Mat3): Float32Array[] {
+export function sampleCells(img: Lab3, hb: Mat3, channels: readonly number[] = [0, 1, 2]): Float32Array[] {
   const out = [new Float32Array(GRID * GRID), new Float32Array(GRID * GRID), new Float32Array(GRID * GRID)];
   const buf = [new Float32Array(SAMPLES.length), new Float32Array(SAMPLES.length), new Float32Array(SAMPLES.length)];
   const { data, width, height } = img;
+  const stride = img.stride ?? 3;
+  const chans = channels.filter((c) => c < stride);
   for (let j = 0; j < GRID; j++) {
     for (let i = 0; i < GRID; i++) {
       let n = 0;
@@ -70,13 +98,11 @@ export function sampleCells(img: Lab3, hb: Mat3): Float32Array[] {
         const x = Math.round(p[0]);
         const y = Math.round(p[1]);
         if (!(x >= 0 && y >= 0 && x < width && y < height)) continue;
-        const o = (y * width + x) * 3;
-        buf[0]![n] = data[o]!;
-        buf[1]![n] = data[o + 1]!;
-        buf[2]![n] = data[o + 2]!;
+        const o = (y * width + x) * stride;
+        for (const c of chans) buf[c]![n] = data[o + c]!;
         n++;
       }
-      for (let c = 0; c < 3; c++) out[c]![j * GRID + i] = n >= 6 ? median(buf[c]!, n) : NaN;
+      for (const c of chans) out[c]![j * GRID + i] = n >= 6 ? median(buf[c]!, n) : NaN;
     }
   }
   return out;
@@ -173,16 +199,52 @@ function ringFactor(v: Float32Array, med: number): number {
   return continuing === 0 ? 1 : continuing === 1 ? 0.4 : 0.2;
 }
 
+/** Multiplier < 1 when the ring around the core contradicts the surround observed on the locked board. */
+function surroundFactor(surround: BoardProfile['surround'] | undefined, v: Float32Array): number {
+  if (!surround || surround === 'frame') return 1;
+  const r = ringLevel(v);
+  if (Number.isNaN(r)) return 1;
+  if (surround === 'dark') return r > SURROUND_DARK_MAX ? 0.7 : 1;
+  return r < SURROUND_BARE_MIN ? 0.7 : 1;
+}
+
+/** Ring median level relative to the darker (0) and lighter (1) square medians of the core. */
+function ringLevel(v: Float32Array): number {
+  const even: number[] = [];
+  const odd: number[] = [];
+  for (let j = 0; j < 8; j++)
+    for (let i = 0; i < 8; i++) {
+      const a = cellAt(v, i, j);
+      if (!Number.isNaN(a)) ((i + j) & 1 ? odd : even).push(a);
+    }
+  const ring: number[] = [];
+  for (let k = 0; k < 8; k++)
+    for (const [i, j] of [[k, -1], [k, 8], [-1, k], [8, k]] as const) {
+      const a = cellAt(v, i, j);
+      if (!Number.isNaN(a)) ring.push(a);
+    }
+  if (even.length < 8 || odd.length < 8 || ring.length < 8) return NaN;
+  const me = medianOf(even);
+  const mo = medianOf(odd);
+  const lo = Math.min(me, mo);
+  const hi = Math.max(me, mo);
+  if (hi - lo < 1e-6) return NaN;
+  return (medianOf(ring) - lo) / (hi - lo);
+}
+
 export function verifyBoard(img: Lab3, hb: Mat3, opt: VerifyOptions): VerifyResult {
-  const chans = sampleCells(img, hb);
-  let best: VerifyResult = { score: 0, alternation: 0, ringFactor: 1, channel: 0, cells: new Float32Array(64), contrast: 0 };
-  for (let c = 0; c < 3; c++) {
+  const scored = (opt.channels ?? [0, 1, 2]).filter((c) => c < (img.stride ?? 3));
+  const chans = sampleCells(img, hb, scored);
+  let best: VerifyResult = { score: 0, alternation: 0, ringFactor: 1, channel: scored[0] ?? 0, cells: new Float32Array(64), contrast: 0, ringLevel: NaN };
+  for (const c of scored) {
     const a = alternationScore(chans[c]!, opt.minContrast);
     if (a.score <= 0) continue;
     const rf = ringFactor(chans[c]!, a.med);
-    const score = a.score * rf;
-    if (score > best.score) best = { score, alternation: a.score, ringFactor: rf, channel: c, cells: a.cells, contrast: a.med };
+    const score = a.score * rf * surroundFactor(opt.surround, chans[c]!);
+    const bar = best.channel === 0 && best.score > 0 ? best.score + (opt.lBias ?? 0) : best.score;
+    if (score > bar) best = { score, alternation: a.score, ringFactor: rf, channel: c, cells: a.cells, contrast: a.med, ringLevel: NaN };
   }
+  if (best.score > 0) best.ringLevel = ringLevel(chans[best.channel]!);
   return best;
 }
 

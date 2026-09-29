@@ -7,7 +7,8 @@ import { extractLines, LINES_PARAMS } from './lines';
 import { param, Preprocessor, PREPROCESS_PARAMS, type CV, type ParamSpec, type PreprocessResult } from './preprocess';
 import { EdgePolisher } from './polish';
 import { CornerRefiner, refineOptions, REFINE_PARAMS, type RefineResult } from './refine';
-import { boardCorners, verifyBoard, verifyOptions, VERIFY_PARAMS, type Lab3, type VerifyResult } from './verify';
+import type { BoardProfile } from './profile';
+import { boardCorners, verifyBoard, verifyOptions, VERIFY_PARAMS, type Lab3, type VerifyOptions, type VerifyResult } from './verify';
 
 type Mat = InstanceType<CV['Mat']>;
 
@@ -67,10 +68,16 @@ export interface DetectResult {
   confidence: number;
   timings: Record<string, number>;
   debug?: DetectDebug;
+  /** Checker verification of the reported board (present when corners are). */
+  verify?: { channel: number; contrast: number; ringFactor: number; ringLevel?: number };
+  /** Verified board (cell units) -> image homography (present when corners are). */
+  hb?: Mat3;
 }
 
 export interface DetectOptions {
   debug?: boolean;
+  /** Locked board profile: restricts preprocessing and verification to the channels it names. */
+  profile?: BoardProfile | null;
 }
 
 function isConvex(q: readonly Point[]): boolean {
@@ -144,7 +151,8 @@ export class Detector {
     const width = rgba.cols;
     const height = rgba.rows;
 
-    const pre = this.pre.run(rgba, params);
+    const profile = opts.profile ?? undefined;
+    const pre = this.pre.run(rgba, params, { channels: profile?.channels });
     this.lastPre = pre;
     Object.assign(timings, pre.timings);
     t = performance.now();
@@ -185,7 +193,8 @@ export class Detector {
     }
     const ctx: SolveContext = {
       nsegs, frame, width, height, params,
-      lab: { data: pre.labEq.data, width, height },
+      lab: { data: pre.labEq.data, width, height, stride: pre.stride },
+      vopt: verifyOptions(params, profile),
     };
     // 5-6. Rectify, comb fit, verify.
     const pass1 = solveGrid(ctx, pair.vp1.vp, pair.vp2.vp, pair.vp1.inliers, pair.vp2.inliers, param(params, GRID_PARAMS, 'maxCandidates'));
@@ -244,7 +253,7 @@ export class Detector {
       lap('polish');
     }
     if (rr?.ok && param(params, REFINE_PARAMS, 'refineReplace') > 0 && isValidQuad(boardCorners(rr.hb), width, height)) {
-      const v = verifyBoard(ctx.lab, rr.hb, verifyOptions(params));
+      const v = verifyBoard(ctx.lab, rr.hb, ctx.vopt);
       if (v.score >= score - param(params, REFINE_PARAMS, 'refineKeepTol')) {
         hb = rr.hb;
         score = Math.max(v.score, score * 0.999);
@@ -253,7 +262,11 @@ export class Detector {
     }
     if (debug && rr?.ok) debug.refined = { hb: rr.hb, inliers: rr.inliers, accepted: rr.accepted, rms: rr.rms };
     const corners = orientedCorners(boardCorners(hb));
-    return finish(corners, score);
+    const fv = verifyBoard(ctx.lab, hb, profile ? ctx.vopt : { ...ctx.vopt, lBias: 0.1 });
+    const res = finish(corners, score);
+    res.verify = { channel: fv.channel, contrast: fv.contrast, ringFactor: fv.ringFactor, ringLevel: fv.ringLevel };
+    res.hb = hb;
+    return res;
   }
 }
 
@@ -264,6 +277,7 @@ interface SolveContext {
   height: number;
   params: Params;
   lab: Lab3;
+  vopt: VerifyOptions;
 }
 
 interface Solved {
@@ -300,7 +314,7 @@ function solveGrid(ctx: SolveContext, vp1: Vec3, vp2: Vec3, idx1: readonly numbe
   const combos: Array<[CombHypothesis, CombHypothesis]> = [];
   for (const hx of out.hypsX) for (const hy of out.hypsY) combos.push([hx, hy]);
   combos.sort((a, b) => b[0].score + b[1].score - (a[0].score + a[1].score));
-  const vopt = verifyOptions(params);
+  const vopt = ctx.vopt;
   const toPix: Mat3 = [frame.s, 0, frame.cx, 0, frame.s, frame.cy, 0, 0, 1];
   const rectInvPix = mul3(toPix, rect.Hinv);
   for (const [hx, hy] of combos.slice(0, maxCand)) {

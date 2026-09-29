@@ -74,17 +74,18 @@ const QO: Array<[number, number]> = (() => {
 
 function makeSampler(img: Lab3, channel: number) {
   const { data, width, height } = img;
+  const stride = img.stride ?? 3;
   return (x: number, y: number): number => {
     if (!(x >= 0 && y >= 0 && x < width - 1 && y < height - 1)) return NaN;
     const x0 = x | 0;
     const y0 = y | 0;
     const fx = x - x0;
     const fy = y - y0;
-    const o = (y0 * width + x0) * 3 + channel;
-    const o2 = o + width * 3;
+    const o = (y0 * width + x0) * stride + channel;
+    const o2 = o + width * stride;
     return (
-      data[o]! * (1 - fx) * (1 - fy) + data[o + 3]! * fx * (1 - fy) +
-      data[o2]! * (1 - fx) * fy + data[o2 + 3]! * fx * fy
+      data[o]! * (1 - fx) * (1 - fy) + data[o + stride]! * fx * (1 - fy) +
+      data[o2]! * (1 - fx) * fy + data[o2 + stride]! * fx * fy
     );
   };
 }

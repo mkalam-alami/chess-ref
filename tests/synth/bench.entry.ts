@@ -7,7 +7,7 @@ import { test } from 'vitest';
 import { Detector } from '../../src/vision/detector';
 import { encodePng } from './png';
 import { loadCv } from './cvNode';
-import { dumpFailure, formatTable, negativeCases, realCases, recallWhere, runCases, summarize, synthCases, type Outcome } from './bench';
+import { dumpFailure, formatTable, negativeCases, realCases, recallWhere, runCases, runCasesLocked, summarize, synthCases, type Outcome } from './bench';
 
 const OUT = path.resolve(import.meta.dirname, 'out');
 
@@ -36,7 +36,33 @@ test('bench', async () => {
     ...(filter || only === 'synth' ? [] : [...realCases(cv, 640), ...realCases(cv, 800)]),
   ];
   const genSec = (Date.now() - t0) / 1000;
-  const outs: Outcome[] = runCases(det, cases, JSON.parse(process.env.BENCH_PARAMS ?? '{}') as Record<string, number>, true);
+  const benchParams = JSON.parse(process.env.BENCH_PARAMS ?? '{}') as Record<string, number>;
+  const outs: Outcome[] = runCases(det, cases, benchParams, true);
+  if (process.env.BENCH_LOCKED) {
+    // Locked-profile run: see runCasesLocked. Prints the locked table, per-stage means and the profiles.
+    const locked = runCasesLocked(det, cases, benchParams, false);
+    console.log(`\n== UNLOCKED ==\n${formatTable(summarize(outs))}\n\n== LOCKED ==\n${formatTable(summarize(locked.outs))}\n`);
+    const stage = (os: Outcome[]) => {
+      const a: Record<string, number> = {};
+      for (const o of os) for (const [k, v] of Object.entries(o.res.timings)) a[k] = (a[k] ?? 0) + v / os.length;
+      return Object.entries(a).map(([k, v]) => `${k} ${v.toFixed(1)}`).join(', ');
+    };
+    const pos = (os: Outcome[]) => os.filter((o) => o.c.gt && !o.c.label.startsWith('negative'));
+    console.log('unlocked stages (all): ' + stage(outs));
+    console.log('locked stages (all):   ' + stage(locked.outs));
+    console.log(`positives ok: unlocked ${pos(outs).filter((o) => o.ok).length}/${pos(outs).length}, locked ${pos(locked.outs).filter((o) => o.ok).length}/${pos(locked.outs).length}`);
+    console.log(`false positives: unlocked ${outs.filter((o) => o.falsePositive).length}, locked ${locked.outs.filter((o) => o.falsePositive).length}`);
+    const prof = new Map<string, number>();
+    locked.outs.forEach((o, i) => {
+      const p = locked.profiles[i];
+      const key = `${o.c.label.replace(/-\d+$/, '')} ${p ? `ch=${p.channels.join('')} v=${p.verifyChannel} ${p.surround}` : 'none'}`;
+      prof.set(key, (prof.get(key) ?? 0) + 1);
+      if (process.env.BENCH_VERBOSE && o.c.label.startsWith('real')) console.log(o.c.name, JSON.stringify(p), 'unlocked err', outs[i]!.err, 'locked err', o.err);
+    });
+    console.log([...prof.entries()].sort().map(([k, v]) => `${k}: ${v}`).join('\n'));
+    det.dispose();
+    return;
+  }
   if (process.env.BENCH_VERBOSE) {
     for (const o of outs) {
       const d = o.res.debug!;

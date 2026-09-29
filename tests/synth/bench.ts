@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import type { Point } from '../../src/geom/homography';
+import { inferProfile, type BoardProfile } from '../../src/vision/profile';
 import { Detector, type DetectResult } from '../../src/vision/detector';
 import type { CV } from '../../src/vision/preprocess';
 import type { Params } from '../../src/worker/protocol';
@@ -126,6 +127,35 @@ export function runCases(det: Detector, cases: Case[], params: Params = {}, debu
     const ok = err !== null && err < ERR_THRESHOLD;
     return { c, res, err, ok, falsePositive: !c.gt && res.corners !== null, ms };
   });
+}
+
+/**
+ * Locked run: each case is first detected unlocked (that detection defines the profile, as the first
+ * confident detection would in the app), then detected again with the profile locked. Returns the locked
+ * outcomes (times are those of the locked run) and the profile per case (null when nothing was inferred, in
+ * which case the locked run is the unlocked one).
+ */
+export function runCasesLocked(det: Detector, cases: Case[], params: Params = {}, debug = false): { outs: Outcome[]; profiles: (BoardProfile | null)[] } {
+  const first = cases[0];
+  if (first) {
+    det.detect(imageOf(first), params);
+    const p = inferProfile(det.detect(imageOf(first), params));
+    if (p) det.detect(imageOf(first), params, { profile: p });
+  }
+  const profiles: (BoardProfile | null)[] = [];
+  const outs = cases.map((c) => {
+    const unlocked = det.detect(imageOf(c), params);
+    const profile = inferProfile(unlocked);
+    profiles.push(profile);
+    const t = performance.now();
+    const res = profile ? det.detect(imageOf(c), params, { debug, profile }) : det.detect(imageOf(c), params, { debug });
+    const ms = performance.now() - t;
+    let err: number | null = null;
+    if (res.corners && c.gt) err = cornerError(res.corners, c.gt);
+    const ok = err !== null && err < ERR_THRESHOLD;
+    return { c, res, err, ok, falsePositive: !c.gt && res.corners !== null, ms };
+  });
+  return { outs, profiles };
 }
 
 export interface Row {
