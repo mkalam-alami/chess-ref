@@ -51,7 +51,15 @@ describe('tracking rejection', () => {
     const real = realCases(cv, 640).filter((c) => c.gt)[0]!;
     const first = det.detect(img(real), {});
     expect(first.hb).toBeDefined();
-    const neg = negativeCases(cv)[3]!;
+    const n0 = negativeCases(cv)[3]!;
+    // Same frame size as the real photo, so the session does not reset for a size change.
+    const src = new cv.Mat(n0.height, n0.width, cv.CV_8UC4);
+    const dst = new cv.Mat();
+    src.data.set(n0.rgba);
+    cv.resize(src, dst, new cv.Size(real.width, real.height));
+    const neg = { rgba: new Uint8ClampedArray(dst.data), width: real.width, height: real.height };
+    src.delete();
+    dst.delete();
     const tr = det.track(img(neg), {}, first.hb!);
     expect(tr.corners).toBeNull();
     const session = new TrackingSession(det);
