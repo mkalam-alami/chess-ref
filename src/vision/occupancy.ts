@@ -1,4 +1,4 @@
-import { OCC_BLACK, OCC_EMPTY, OCC_WHITE, type OccupancyStats, type Params } from '../worker/protocol';
+import { OCC_BLACK, OCC_EMPTY, OCC_WHITE, type Observation, type OccupancyStats, type Params } from '../worker/protocol';
 import { solveLinear, type Mat3, type Point, type Vec3 } from '../geom/homography';
 import { param, type ParamSpec } from './preprocess';
 
@@ -44,6 +44,20 @@ export const OCCUPANCY_PARAMS: readonly ParamSpec[] = [
   { name: 'occLikVisGamma', min: 0.1, max: 1, step: 0.05, default: 0.25 },
   /** EMA rate of the model updates from confident cells. */
   { name: 'occLearnRate', min: 0, max: 0.2, step: 0.005, default: 0.02 },
+  /** Without a board for longer than this (ms), the orientation (which cell is a1) must be re-verified. */
+  { name: 'occLossMs', min: 200, max: 10000, step: 100, default: 1000 },
+  /** Orientation: summed log-likelihood (nats) by which the best dihedral placement of the target grid (position hint,
+   *  else the starting position) must beat the best placement predicting a different cell grid. */
+  { name: 'occOrientMargin', min: 1, max: 60, step: 1, default: 12 },
+  /** Orientation: most cells allowed to confidently contradict the best placement (p of its class < 0.1). A hint one
+   *  move behind the board (a move made while it was hidden) differs by 2-4 cells, and the frame itself may have a few
+   *  confident errors (light squares read as white pieces on low-contrast boards); the margin does the real work. */
+  { name: 'occOrientMaxMiss', min: 0, max: 16, step: 1, default: 8 },
+  /** Orientation: consecutive stable frames that must agree on the same placement before it is adopted. */
+  { name: 'occOrientFrames', min: 1, max: 10, step: 1, default: 2 },
+  /** Dark-a1 check: least lightness difference (L*) between the two parities' empty models for the check to count;
+   *  below it the parity is inconclusive and the handedness alone decides. */
+  { name: 'occParityMinDL', min: 0, max: 30, step: 1, default: 4 },
 ];
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -686,8 +700,18 @@ export class OccupancyFilter {
     return nowMs - this.unstableAt < param(params, OCCUPANCY_PARAMS, 'occSettleMs');
   }
 
-  /** Cells with conf below `occCellMin` are ignored. Returns whether commits are frozen. */
-  update(raw: Uint8Array, conf: Float32Array, params: Params, nowMs: number): boolean {
+  /** Overrides the committed grid (position hint) without touching the freeze state. */
+  setCommitted(grid: Uint8Array): void {
+    if (!this.committed) this.committed = new Uint8Array(grid);
+    else this.committed.set(grid);
+  }
+
+  /**
+   * Cells with conf below `occCellMin` are ignored. Returns whether commits are frozen. With `commit` false (a
+   * position hint owns the committed grid) only the freeze detection runs: the committed grid and the per-cell
+   * hysteresis are left alone.
+   */
+  update(raw: Uint8Array, conf: Float32Array, params: Params, nowMs: number, commit = true): boolean {
     if (!this.committed) this.committed = new Uint8Array(raw);
     const cellMin = param(params, OCCUPANCY_PARAMS, 'occCellMin');
     const hold = param(params, OCCUPANCY_PARAMS, 'occHoldFrames');
@@ -699,6 +723,10 @@ export class OccupancyFilter {
       if (conf[c]! < cellMin) continue;
       const r = raw[c]!;
       this.prev[c] = r;
+      if (!commit) {
+        this.count[c] = 0;
+        continue;
+      }
       if (r === this.committed[c]) {
         this.count[c] = 0;
         continue;
@@ -733,7 +761,8 @@ export class OccupancyFilter {
 // Tracker
 
 export interface OccupancyResult {
-  /** Committed grid (cell (i, j) at j * 8 + i), or null when this frame was dropped / not calibrated yet. */
+  /** Committed grid (cell (i, j) at j * 8 + i), or null when this frame was dropped / not calibrated yet. While a
+   *  position hint is in effect (see OccupancyTracker.setPosition) this is the hint in board cell order. */
   grid: Uint8Array | null;
   /** This frame's raw classification (all empty before calibration). */
   raw: Uint8Array;
@@ -743,7 +772,8 @@ export interface OccupancyResult {
    * Per-cell class log-probabilities, cell c's (empty, white, black) at c * 3 + (0, 1, 2), normalised per cell
    * (logsumexp = 0). Hidden / low-visibility cells and outliers are flattened towards uniform (log 1/3) by the evidence
    * lost (weight vis^occLikVisGamma, exactly uniform at vis 0). All uniform before calibration and on frames without a camera. Intended for scoring
-   * candidate (legal) positions: sum logLik[c * 3 + class(c)] over the cells.
+   * candidate (legal) positions: sum logLik[c * 3 + class(c)] over the cells. Always in board cell order (the
+   * observation carries the chess-square-ordered copy).
    */
   logLik: Float32Array;
   /**
@@ -752,6 +782,14 @@ export interface OccupancyResult {
    */
   committedProb: Float32Array | null;
   stats: OccupancyStats;
+  /**
+   * The frame's evidence for the game layer: logLik and the visible fractions in chess square order when oriented
+   * (board cell order otherwise), the calibration state, and `stable` = calibrated, not dropped and not frozen (a
+   * freeze covers mass changes such as a hand, and the `occSettleMs` after any frame without a board).
+   */
+  observation: Observation;
+  /** orientation[sq] = board cell of chess square sq (a1 = 0 ... h8 = 63); null while not oriented. */
+  orientation: Uint8Array | null;
 }
 
 export interface OccupancyDebug {
@@ -763,7 +801,8 @@ export interface OccupancyDebug {
   feats: CellFeatures;
 }
 
-/** The 8 relabellings of the board square: new board point (x, y) is old point g(x, y). */
+/** The 8 relabellings of the board square: new board point (x, y) is old point g(x, y). The first 4 are rotations
+ *  (they keep the handedness of the board frame), the last 4 reflections. */
 const DIHEDRAL: ReadonlyArray<(x: number, y: number) => Point> = [
   (x, y) => [x, y], (x, y) => [8 - y, x], (x, y) => [8 - x, 8 - y], (x, y) => [y, 8 - x],
   (x, y) => [y, x], (x, y) => [8 - x, y], (x, y) => [x, 8 - y], (x, y) => [8 - y, 8 - x],
@@ -774,8 +813,19 @@ const applyHb = (h: Mat3, x: number, y: number): Point => {
   return [(h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w];
 };
 
-/** Cell map (new cell -> old cell) when `hb` is a clear dihedral relabelling of `prev`; null when it is not. */
-export function dihedralRemap(prev: Mat3, hb: Mat3): Uint8Array | null {
+export interface DihedralMatch {
+  /** Cell map (new cell -> old cell) when `hb` is a clear non-identity relabelling of `prev`; null otherwise. */
+  map: Uint8Array | null;
+  /**
+   * Whether `hb` is clearly one of the 8 labellings of `prev` (the identity included). False when the board moved too
+   * much between the two (e.g. the camera moved during a long loss) to tell which labelling it is: the cell state
+   * (filter, per-parity models, orientation) may then be misaligned.
+   */
+  resolved: boolean;
+}
+
+/** Matches `hb` against the previous frame's homography within the board's dihedral ambiguity (corner distances). */
+export function dihedralMatch(prev: Mat3, hb: Mat3): DihedralMatch {
   const corners: Point[] = [[0, 0], [8, 0], [8, 8], [0, 8]];
   const now = corners.map(([x, y]) => applyHb(hb, x, y));
   const diag = Math.hypot(now[0]![0] - now[2]![0], now[0]![1] - now[2]![1]);
@@ -790,19 +840,136 @@ export function dihedralRemap(prev: Mat3, hb: Mat3): Uint8Array | null {
   });
   let best = 0;
   for (let g = 1; g < 8; g++) if (errs[g]! < errs[best]!) best = g;
-  if (best === 0 || !(errs[best]! < 0.1 * diag) || !(errs[0]! > 2 * errs[best]!)) return null;
+  let second = Infinity;
+  for (let g = 0; g < 8; g++) if (g !== best) second = Math.min(second, errs[g]!);
+  const close = errs[best]! < 0.1 * diag;
+  const resolved = close && second > 2 * errs[best]!;
+  if (best === 0 || !close || !(errs[0]! > 2 * errs[best]!)) return { map: null, resolved };
   const map = new Uint8Array(64);
   for (let c = 0; c < 64; c++) {
     const [u, v] = DIHEDRAL[best]!((c & 7) + 0.5, (c >> 3) + 0.5);
     map[c] = Math.floor(v) * 8 + Math.floor(u);
   }
-  return map;
+  return { map, resolved };
+}
+
+/** Cell map (new cell -> old cell) when `hb` is a clear dihedral relabelling of `prev`; null when it is not. */
+export function dihedralRemap(prev: Mat3, hb: Mat3): Uint8Array | null {
+  return dihedralMatch(prev, hb).map;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Orientation (board cell -> chess square)
+
+/**
+ * The 8 candidate orientations: ORIENT_MAPS[g][sq] = board cell of chess square sq (file sq & 7, rank sq >> 3) when
+ * the chess frame (files a->h, ranks 1->8) sits on the board as DIHEDRAL[g]: square (f, r) covers board point
+ * g(f + 0.5, r + 0.5). g = 0 is the identity (a1 = cell (0, 0), files along i, ranks along j). g < 4 keep the
+ * handedness of the board cell frame, g >= 4 reverse it.
+ */
+export const ORIENT_MAPS: readonly Uint8Array[] = DIHEDRAL.map((g) => {
+  const m = new Uint8Array(64);
+  for (let sq = 0; sq < 64; sq++) {
+    const [u, v] = g((sq & 7) + 0.5, (sq >> 3) + 0.5);
+    m[sq] = Math.floor(v) * 8 + Math.floor(u);
+  }
+  return m;
+});
+
+/** The starting position's occupancy in chess square order (white on ranks 1-2). */
+export const START_SQUARES: Uint8Array = Uint8Array.from({ length: 64 }, (_, sq) =>
+  sq >> 3 <= 1 ? OCC_WHITE : sq >> 3 >= 6 ? OCC_BLACK : OCC_EMPTY,
+);
+
+/** Re-orders a per-cell array (`stride` values per cell) into chess square order: out[sq] = a[orientation[sq]]. */
+export function toSquareOrder<T extends Float32Array | Uint8Array>(a: T, orientation: ArrayLike<number>, stride = 1): T {
+  const out = new (a.constructor as new (n: number) => T)(a.length);
+  for (let sq = 0; sq < 64; sq++) for (let k = 0; k < stride; k++) out[sq * stride + k] = a[orientation[sq]! * stride + k]!;
+  return out;
+}
+
+/** Inverse of toSquareOrder for a 64-entry grid: out[orientation[sq]] = g[sq] (a chess-ordered grid to board cells). */
+export function toCellOrder(g: Uint8Array, orientation: ArrayLike<number>): Uint8Array {
+  const out = new Uint8Array(64);
+  for (let sq = 0; sq < 64; sq++) out[orientation[sq]!] = g[sq]!;
+  return out;
+}
+
+/**
+ * Handedness of the board cell frame seen by the camera: +1 when (i, j, up) is right-handed, with "up" the side of
+ * the board the camera looks at. The camera is always above the board, so this is the sign of the pose's
+ * (r1 x r2) . (towards the camera) in cameraFromHomography terms, which reduces to the orientation of the image
+ * of the board: a right-handed frame seen from above appears counter-clockwise (x then y), i.e. with a negative
+ * Jacobian determinant in image coordinates (y down). The Jacobian of a homography at a point is det(H) / w^3, so
+ * its sign is that of det(H) * w, taken at the board centre. 0 for a degenerate hb.
+ */
+export function boardHandedness(hb: Mat3): number {
+  const det =
+    hb[0] * (hb[4] * hb[8] - hb[5] * hb[7]) - hb[1] * (hb[3] * hb[8] - hb[5] * hb[6]) + hb[2] * (hb[3] * hb[7] - hb[4] * hb[6]);
+  const j = det * (4 * hb[6] + 4 * hb[7] + hb[8]);
+  return j < 0 ? 1 : j > 0 ? -1 : 0;
+}
+
+export type OrientRefusal = 'margin' | 'miss' | 'mirror' | 'ambiguous' | 'parity';
+
+export type OrientChoice = { g: number; score: number; gap: number } | { g: -1; reason: OrientRefusal };
+
+/**
+ * Chooses the orientation from one frame's evidence. The target grid (chess square order: the game's position hint,
+ * else the starting position) is placed on the cells under each of the 8 maps and scored by the summed logLik; the
+ * best placement must beat every placement predicting a DIFFERENT cell grid by `margin` nats, and at most `maxMiss`
+ * cells may confidently contradict it (p < 0.1). Placements predicting the same cell grid (a symmetric target: the
+ * starting position is symmetric under the a<->h mirror) are told apart by the handedness: the chess frame
+ * (files, ranks, up) must be right-handed, i.e. white's left is the a-file. The handedness also cross-checks an
+ * asymmetric winner ('mirror' when it contradicts: a mirrored image). Finally a1 must be a dark square:
+ * `darkParity` (parity of the darker empty squares, -1 when inconclusive) must match a1's cell parity.
+ */
+export function chooseOrientation(
+  logLik: Float32Array, target: Uint8Array, handed: number, darkParity: number, margin: number, maxMiss: number,
+): OrientChoice {
+  const grids = ORIENT_MAPS.map((m) => toCellOrder(target, m));
+  const scores = grids.map((g) => {
+    let s = 0;
+    for (let c = 0; c < 64; c++) s += logLik[c * 3 + g[c]!]!;
+    return s;
+  });
+  let best = 0;
+  for (let g = 1; g < 8; g++) if (scores[g]! > scores[best]!) best = g;
+  const same = (a: Uint8Array, b: Uint8Array) => a.every((v, c) => v === b[c]);
+  const group: number[] = [];
+  let second = -Infinity;
+  for (let g = 0; g < 8; g++) {
+    if (same(grids[g]!, grids[best]!)) group.push(g);
+    else second = Math.max(second, scores[g]!);
+  }
+  const gap = scores[best]! - second;
+  if (!(gap >= margin)) return { g: -1, reason: 'margin' };
+  let miss = 0;
+  const lo = Math.log(0.1);
+  for (let c = 0; c < 64; c++) if (logLik[c * 3 + grids[best]![c]!]! < lo) miss++;
+  if (miss > maxMiss) return { g: -1, reason: 'miss' };
+  const cands = group.filter((g) => (g < 4 ? 1 : -1) === handed);
+  if (cands.length === 0) return { g: -1, reason: 'mirror' };
+  if (cands.length > 1) return { g: -1, reason: 'ambiguous' };
+  const g = cands[0]!;
+  if (darkParity >= 0 && parityOf(ORIENT_MAPS[g]![0]!) !== darkParity) return { g: -1, reason: 'parity' };
+  return { g, score: scores[g]!, gap };
 }
 
 /**
  * Square occupancy (empty / white / black) from the raw frame and the board homography: camera-aware footprints,
  * per-parity class models calibrated on the starting position (or unsupervised after `occFallbackMs`), per-cell
  * confidence, frame dropping and the temporal filter.
+ *
+ * Orientation (milestone 9): which cell is which chess square. Found by chooseOrientation on stable frames, against
+ * the position hint when one is set, else against the starting position (so the first orientation comes right after
+ * the start-position calibration), and adopted after `occOrientFrames` consecutive agreeing frames. It is permuted
+ * with the cells on dihedral relabellings, and marked unverified (not dropped: the class models survive too) after
+ * more than `occLossMs` without a board or a relabelling that cannot be resolved; it is then re-found the same way.
+ * Only reset() (the reset / resetProfile messages) drops the models and the orientation.
+ *
+ * Position hint (setPosition): while set and oriented it replaces the filter's committed grid (occluder prior,
+ * illumination and learning labels, the returned grid); the filter then only detects freezes.
  */
 export class OccupancyTracker {
   private models: Models | null = null;
@@ -814,10 +981,26 @@ export class OccupancyTracker {
   private bootCount = 0;
   private firstSeenAt = NaN;
   private lastHb: Mat3 | null = null;
+  private lastBoardAt = NaN;
   private lastStats: OccupancyStats = { state: 'start', empty: 0, white: 0, black: 0, lowCells: 0, dropped: false, frozen: false };
+  /** Position hint from the game, chess square order; kept across reset() (the main thread owns it). */
+  private hint: Uint8Array | null = null;
+  /** Last orientation found (square -> cell), permuted with the cells; trusted only while `orientOk`. */
+  private orient: Uint8Array | null = null;
+  private orientOk = false;
+  /** Placement (ORIENT_MAPS index in the current cell frame) chosen on the last evaluated frames, and their count. */
+  private orientCand = -1;
+  private orientCount = 0;
+  /** After an unresolved relabelling: the per-parity models must be checked against the frame, and the filter's
+   *  committed grid is stale until the next orientation. */
+  private parityUnchecked = false;
+  private filterStale = false;
+  /** Why the last orientation attempt failed (debug); '' when oriented or not tried. */
+  orientReason: OrientRefusal | 'uncalibrated' | '' = '';
   /** Footprints and weights of the last frame, for the debug view. */
   debug: OccupancyDebug | null = null;
 
+  /** Drops the models, the filter and the orientation (keeps the position hint). */
   reset(): void {
     this.models = null;
     this.state = 'start';
@@ -826,11 +1009,31 @@ export class OccupancyTracker {
     this.bootCount = 0;
     this.firstSeenAt = NaN;
     this.lastHb = null;
+    this.lastBoardAt = NaN;
+    this.orient = null;
+    this.unverify();
+    this.parityUnchecked = false;
+    this.filterStale = false;
+    this.orientReason = '';
     this.debug = null;
   }
 
   get calibrated(): boolean {
     return this.models !== null;
+  }
+
+  get oriented(): boolean {
+    return this.orientOk && this.orient !== null;
+  }
+
+  /** orientation[sq] = board cell of chess square sq, or null while not (re-)verified. */
+  get orientation(): Uint8Array | null {
+    return this.oriented ? new Uint8Array(this.orient!) : null;
+  }
+
+  /** The game's position (64 entries, chess square order) or null (no game): see the class doc. */
+  setPosition(grid: Uint8Array | null): void {
+    this.hint = grid && grid.length === 64 ? new Uint8Array(grid) : null;
   }
 
   noBoard(nowMs: number): OccupancyStats {
@@ -845,16 +1048,24 @@ export class OccupancyTracker {
     const conf = new Float32Array(64);
     const logLik = new Float32Array(64 * 3).fill(-Math.log(3));
     if (Number.isNaN(this.firstSeenAt)) this.firstSeenAt = nowMs;
+    // A long loss: the board may have been turned, or the camera moved; the orientation must be re-verified.
+    if (nowMs - this.lastBoardAt > param(params, OCCUPANCY_PARAMS, 'occLossMs')) this.unverify();
+    this.lastBoardAt = nowMs;
     // Keep the grid in hb's frame if the detector relabelled the board corners.
     if (this.lastHb) {
-      const map = dihedralRemap(this.lastHb, hb);
-      if (map) this.permute(map);
+      const m = dihedralMatch(this.lastHb, hb);
+      if (m.map) this.permute(m.map);
+      else if (!m.resolved) {
+        this.unverify();
+        this.parityUnchecked = this.models !== null;
+        this.filterStale = true;
+      }
     }
     this.lastHb = hb;
     const cam = cameraFromHomography(hb, frame.width, frame.height, param(params, OCCUPANCY_PARAMS, 'occFovDeg'));
     const fail = (): OccupancyResult => {
       this.lastStats = this.stats(0, true, false);
-      return { grid: null, raw, conf, logLik, committedProb: null, stats: this.lastStats };
+      return this.result(nowMs, null, raw, conf, logLik, new Float32Array(64), null, false);
     };
     if (!cam) return fail();
     const fp = cellFootprints(cam, frame.width, frame.height, params);
@@ -866,11 +1077,23 @@ export class OccupancyTracker {
       const u = fitUnsupervised(cellFeatures(fp, s, new Float32Array(64).fill(0.3)), dev);
       if (u && this.calibrate(fp, s, u.grid, dev)) this.state = 'fallback';
     }
-    if (!this.models || !this.filter.committed) return fail();
+    if (!this.models || !this.filter.committed) {
+      this.orientReason = 'uncalibrated';
+      return fail();
+    }
 
+    // The position hint (when oriented) is the committed grid; the filter's own hysteresis is bypassed.
+    const hintCells = this.hintCells();
+    if (hintCells) this.filter.setCommitted(hintCells);
     const committed = this.filter.committed;
     const prior = priorOf(committed);
-    const feats = cellFeatures(fp, s, prior, illumGains(cellFeatures(fp, s, prior), committed, this.refl));
+    let feats = cellFeatures(fp, s, prior, illumGains(cellFeatures(fp, s, prior), committed, this.refl));
+    if (this.parityUnchecked) {
+      const r = this.recheckParity(feats);
+      if (r !== 'inconclusive') this.parityUnchecked = false;
+      if (r === 'swapped') feats = cellFeatures(fp, s, prior, illumGains(cellFeatures(fp, s, prior), committed, this.refl));
+    }
+    const models = this.models;
     const outlier = param(params, OCCUPANCY_PARAMS, 'occOutlier');
     const scale = param(params, OCCUPANCY_PARAMS, 'occMarginScale');
     const temp = param(params, OCCUPANCY_PARAMS, 'occLikTemp');
@@ -884,7 +1107,7 @@ export class OccupancyTracker {
       let arg = 0;
       let near = Infinity;
       for (let cls = 0; cls < 3; cls++) {
-        const g = this.models[cls]![p]!;
+        const g = models[cls]![p]!;
         const d = nll(feats.x, c, g);
         d3[cls] = d;
         near = Math.min(near, zdist(feats.x, c, g));
@@ -913,15 +1136,117 @@ export class OccupancyTracker {
     const dropped = low > param(params, OCCUPANCY_PARAMS, 'occMaxLowCells') || sum / 64 < param(params, OCCUPANCY_PARAMS, 'occFrameMin');
     let frozen = this.filter.frozen(nowMs, params);
     if (!dropped) {
-      frozen = this.filter.update(raw, conf, params, nowMs);
-      this.learn(feats, raw, conf, params);
+      frozen = this.filter.update(raw, conf, params, nowMs, !hintCells);
+      this.learn(feats, raw, conf, this.filter.committed!, params);
     }
+    const stable = !dropped && !frozen;
+    if (!this.orientOk && stable) this.tryOrient(logLik, hb, params);
     this.debug = { fp, weights: this.weights(fp, prior), raw, conf, feats };
     this.lastStats = this.stats(low, dropped, frozen);
     const committedNow = this.filter.committed ?? committed;
     const committedProb = new Float32Array(64);
     for (let c = 0; c < 64; c++) committedProb[c] = Math.exp(logLik[c * 3 + committedNow[c]!]!);
-    return { grid: dropped ? null : new Uint8Array(committedNow), raw, conf, logLik, committedProb, stats: this.lastStats };
+    return this.result(nowMs, dropped ? null : new Uint8Array(committedNow), raw, conf, logLik, feats.vis, committedProb, stable);
+  }
+
+  private result(
+    t: number, grid: Uint8Array | null, raw: Uint8Array, conf: Float32Array, logLik: Float32Array, vis: Float32Array,
+    committedProb: Float32Array | null, stable: boolean,
+  ): OccupancyResult {
+    const orientation = this.orientation;
+    const observation: Observation = {
+      t,
+      logLik: orientation ? toSquareOrder(logLik, orientation, 3) : new Float32Array(logLik),
+      vis: orientation ? toSquareOrder(vis, orientation) : new Float32Array(vis),
+      oriented: orientation !== null,
+      calibration: this.lastStats.state,
+      stable,
+    };
+    return { grid, raw, conf, logLik, committedProb, stats: this.lastStats, observation, orientation };
+  }
+
+  /** The position hint in board cell order, when there is one and the orientation is verified. */
+  private hintCells(): Uint8Array | null {
+    return this.hint && this.oriented ? toCellOrder(this.hint, this.orient!) : null;
+  }
+
+  private unverify(): void {
+    this.orientOk = false;
+    this.orientCand = -1;
+    this.orientCount = 0;
+  }
+
+  /** Parity of the dark squares from the calibrated empty models (the darker one), -1 when their lightness is too
+   *  close to tell (`occParityMinDL`). */
+  private darkParity(params: Params): number {
+    const e = this.models![OCC_EMPTY]!;
+    const d = e[0].mu[0]! - e[1].mu[0]!;
+    if (!(Math.abs(d) >= param(params, OCCUPANCY_PARAMS, 'occParityMinDL'))) return -1;
+    return d < 0 ? 0 : 1;
+  }
+
+  /** One orientation attempt on a stable frame (see chooseOrientation); adopted after `occOrientFrames` agreeing ones. */
+  private tryOrient(logLik: Float32Array, hb: Mat3, params: Params): void {
+    const target = this.hint ?? START_SQUARES;
+    const ch = chooseOrientation(
+      logLik, target, boardHandedness(hb), this.darkParity(params),
+      param(params, OCCUPANCY_PARAMS, 'occOrientMargin'), param(params, OCCUPANCY_PARAMS, 'occOrientMaxMiss'),
+    );
+    if (ch.g < 0) {
+      this.orientReason = (ch as { reason: OrientRefusal }).reason;
+      this.orientCand = -1;
+      this.orientCount = 0;
+      return;
+    }
+    this.orientCount = ch.g === this.orientCand ? this.orientCount + 1 : 1;
+    this.orientCand = ch.g;
+    if (this.orientCount < param(params, OCCUPANCY_PARAMS, 'occOrientFrames')) return;
+    this.orient = new Uint8Array(ORIENT_MAPS[ch.g]!);
+    this.orientOk = true;
+    this.orientReason = '';
+    // After an unresolved relabelling the filter's grid belongs to another cell frame: restart it from the target.
+    if (this.filterStale) this.filter.setCommitted(toCellOrder(target, this.orient));
+    this.filterStale = false;
+  }
+
+  /**
+   * After a relabelling that could not be resolved, the per-parity models may be swapped (a quarter turn moves cell
+   * (0, 0) to the other parity). Keeps whichever assignment explains the frame's visible cells better (each cell's
+   * best class NLL, summed), swapping the models and the reflectances when that is clearly the swapped one.
+   */
+  private recheckParity(feats: CellFeatures): 'kept' | 'swapped' | 'inconclusive' {
+    const models = this.models;
+    if (!models) return 'inconclusive';
+    let asIs = 0;
+    let swapped = 0;
+    let n = 0;
+    for (let c = 0; c < 64; c++) {
+      if (feats.vis[c]! < VIS_FIT) continue;
+      const p = parityOf(c);
+      let a = Infinity;
+      let b = Infinity;
+      for (let cls = 0; cls < 3; cls++) {
+        a = Math.min(a, nll(feats.x, c, models[cls]![p]!));
+        b = Math.min(b, nll(feats.x, c, models[cls]![1 - p]!));
+      }
+      asIs += a;
+      swapped += b;
+      n++;
+    }
+    if (n < 16) return 'inconclusive';
+    if (!(swapped < asIs - 0.5 * n)) return 'kept';
+    this.swapParity();
+    return 'swapped';
+  }
+
+  /** Swaps the per-parity models and reflectances (cell (0, 0) changed parity). */
+  private swapParity(): void {
+    if (this.models) for (const m of this.models) m.reverse();
+    for (let cls = 0; cls < 3; cls++) {
+      const t = this.refl[cls * 2]!;
+      this.refl[cls * 2] = this.refl[cls * 2 + 1]!;
+      this.refl[cls * 2 + 1] = t;
+    }
   }
 
   private tryBootstrap(fp: Footprints, s: Samples, params: Params, dev: number): void {
@@ -950,16 +1275,21 @@ export class OccupancyTracker {
     this.models = models;
     this.refl = il.refl;
     this.filter.reset(grid);
+    this.parityUnchecked = false;
+    this.filterStale = false;
     return true;
   }
 
-  /** Slow EMA update of the class models from confident cells that agree with the committed grid. */
-  private learn(feats: CellFeatures, raw: Uint8Array, conf: Float32Array, params: Params): void {
+  /**
+   * Slow EMA update of the class models. Learning guard: only cells whose label (the committed grid, i.e. the
+   * position hint in game mode) AND this frame's own confident classification (conf >= 0.6) agree are used, so a
+   * wrong game commit (or a wrong filter commit) never teaches a model the wrong label.
+   */
+  private learn(feats: CellFeatures, raw: Uint8Array, conf: Float32Array, labels: Uint8Array, params: Params): void {
     const a = param(params, OCCUPANCY_PARAMS, 'occLearnRate');
-    const committed = this.filter.committed;
-    if (!(a > 0) || !this.models || !committed) return;
+    if (!(a > 0) || !this.models) return;
     for (let c = 0; c < 64; c++) {
-      if (conf[c]! < 0.6 || raw[c] !== committed[c]) continue;
+      if (conf[c]! < 0.6 || raw[c] !== labels[c]) continue;
       const g = this.models[raw[c]!]![parityOf(c)]!;
       const floorMul = raw[c] === OCC_EMPTY ? 1 : 1.5;
       for (let f = 0; f < NF; f++) {
@@ -970,10 +1300,19 @@ export class OccupancyTracker {
     }
   }
 
+  /** Re-indexes the cell state after a relabelling: new cell c was old cell map[c]. */
   private permute(map: Uint8Array): void {
     this.filter.permute(map);
-    // A relabelling that moves cell (0,0) to a cell of the other parity swaps the per-parity models.
-    if (this.models && parityOf(map[0]!) !== 0) for (const m of this.models) m.reverse();
+    // A relabelling that moves cell (0,0) to a cell of the other parity swaps the per-parity models (and reflectances).
+    if (parityOf(map[0]!) !== 0) this.swapParity();
+    if (this.orient) {
+      const inv = new Uint8Array(64);
+      for (let c = 0; c < 64; c++) inv[map[c]!] = c;
+      for (let sq = 0; sq < 64; sq++) this.orient[sq] = inv[this.orient[sq]!]!;
+    }
+    // A pending candidate was expressed in the old cell frame.
+    this.orientCand = -1;
+    this.orientCount = 0;
     this.bootCount = 0;
   }
 

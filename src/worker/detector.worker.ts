@@ -7,7 +7,7 @@ import { ProfileLock } from '../vision/profile';
 import { drawOccupancy, OCCUPANCY_PARAMS, OccupancyTracker } from '../vision/occupancy';
 import { param } from '../vision/preprocess';
 import { TrackingSession } from './tracker';
-import type { DebugView, FrameMessage, MainToWorker, OccupancyStats, ResultMessage, WorkerToMain } from './protocol';
+import type { DebugView, FrameMessage, MainToWorker, Observation, OccupancyStats, ResultMessage, WorkerToMain } from './protocol';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -61,6 +61,8 @@ interface State {
 // --- board profile lock (agent B) ---
 const profileLock = new ProfileLock();
 // --- square occupancy (milestone 8): models and temporal filter live next to the profile lock ---
+// The class models and the orientation survive board losses (the orientation is only re-verified after one); only
+// the reset / resetProfile messages drop them. The game's position hint is kept across both.
 const occupancy = new OccupancyTracker();
 let state: State | null = null;
 let canvas: OffscreenCanvas | null = null;
@@ -111,12 +113,16 @@ async function process(msg: FrameMessage): Promise<void> {
   let grid: Uint8Array | null = null;
   let occProb: Float32Array | null = null;
   let occStats: OccupancyStats | undefined;
+  let observation: Observation | null = null;
+  let orientation: Uint8Array | null = null;
   if (param(msg.params, OCCUPANCY_PARAMS, 'occupancy') > 0) {
     if (det.hb) {
       const occ = occupancy.update(img, det.hb, msg.params, performance.now());
       grid = occ.grid;
       occProb = occ.committedProb;
       occStats = occ.stats;
+      observation = occ.observation;
+      orientation = occ.orientation;
     } else occStats = occupancy.noBoard(performance.now());
   }
   timings.occupancy = performance.now() - t;
@@ -179,6 +185,8 @@ async function process(msg: FrameMessage): Promise<void> {
     occupancy: grid,
     occupancyProb: occProb,
     occupancyStats: occStats,
+    observation,
+    orientation,
   };
   post(result, debugImage ? [debugImage] : []);
 }
@@ -195,6 +203,11 @@ scope.onmessage = (ev: MessageEvent<MainToWorker>) => {
   if (msg.type === 'resetProfile') {
     profileLock.reset();
     occupancy.reset();
+    return;
+  }
+  if (msg.type === 'positionHint') {
+    // Applied from the next processed frame on (one frame of latency, see docs/PLAN-game.md).
+    occupancy.setPosition(msg.grid);
     return;
   }
   if (msg.type !== 'frame' || !state) return;

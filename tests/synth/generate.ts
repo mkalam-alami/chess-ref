@@ -553,7 +553,9 @@ export function makeBoardSample(cv: CV, seed: number, spec: SampleSpec, moves: R
   const rng = mulberry32(seed * 7919 + 13);
   const U = (a: number, b: number) => a + (b - a) * rng();
   const style = makeStyle(rng, spec.palette);
-  const meta: Record<string, number | string> = { palette: spec.palette };
+  // flip = 1: generator cell (0, 0) is a LIGHT square, so with the 'start' pieces (white on rows 0-1) no chess
+  // orientation puts a1 on a dark square (vision must refuse to orient); flip = 0: a1 is generator cell (0, 0).
+  const meta: Record<string, number | string> = { palette: spec.palette, flip: style.flip ? 1 : 0 };
   let cam: Camera | null = null;
   let corners: Point[] = [];
   for (let attempt = 0; attempt < 40 && !cam; attempt++) {
